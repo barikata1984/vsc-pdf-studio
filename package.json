@@ -2,7 +2,7 @@
   "name": "vsc-pdf-studio",
   "displayName": "PDF Studio",
   "description": "Review, annotate, fill forms, comment on, search, and navigate PDFs directly inside VS Code.",
-  "version": "0.0.5",
+  "version": "0.0.8",
   "publisher": "ZelalemJembreYalew",
   "icon": "media/icon.png",
   "license": "MIT",

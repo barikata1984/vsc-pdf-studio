@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.0.8 (in progress)
+
+- Added timing instrumentation for each load-to-display stage and per-request render start, completion, and cancellation logs
+- Moved PDF parsing and rendering off the UI thread into a separate worker
+- Separated thumbnail generation from main rendering and generate thumbnails at low resolution when the page list is shown
+- Rendered only the visible pages and their neighbors, released off-screen render results, cancelled in-flight renders on zoom or resize, and reused the parsed document instead of reloading it
+- Changed the render resolution cap from a whole-document total to a per-page limit and made both the page and drawing canvases follow the display pixel density
+
+## 0.0.7
+
+- Fixed interrupted stylus strokes by separating pen annotation handling from finger scrolling
+- Preserved finger annotation when `Allow Finger Drawing` is enabled while keeping touch panning available when it is disabled
+
+## 0.0.6
+
+- Added pen-first touch annotation controls, including an `Allow Finger Drawing` setting and Command Palette toggle
+- Fixed stack-overflow failures when reopening PDFs with large annotation histories and added automatic migration to compressed annotation storage
+- Expanded comment visibility controls to include supported comments and note-bearing markup imported from other PDF editors
+- Improved editor reliability through modularized webview features, stricter payload validation, linting, formatting, and regression tests
+
 ## 0.0.5
 
 - Added view, edit, and delete support for note-bearing highlights, underlines, and strikeouts imported from other PDF editors
