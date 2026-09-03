@@ -109,11 +109,6 @@ export function createInteractionController({
           : textInteractionEnabled
             ? 'text'
             : 'crosshair';
-      pageEntry.drawingCanvas.classList.toggle(
-        'is-finger-drawing-enabled',
-        state.allowFingerDrawing &&
-          (state.mode === 'annotate' || state.mode === 'erase')
-      );
       pageEntry.textLayer.style.userSelect = textInteractionEnabled
         ? 'text'
         : 'none';

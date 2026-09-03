@@ -76,6 +76,7 @@ export function createDrawingLayer(pageEntries, options) {
     strokes: [],
     currentStroke: null,
     activePointerId: null,
+    touchPan: null,
   };
 
   function redrawPage(pageEntry) {
@@ -263,12 +264,21 @@ export function createDrawingLayer(pageEntries, options) {
 
     canvas.addEventListener('pointerdown', (event) => {
       const mode = isStylusEraseEvent(event) ? 'erase' : options.getMode();
-      if (mode === 'select' || !isTouchInputAllowed(event, options)) {
+      if (mode === 'select') {
         return;
       }
 
       event.preventDefault();
       canvas.setPointerCapture(event.pointerId);
+      if (!isTouchInputAllowed(event, options)) {
+        state.touchPan = {
+          pointerId: event.pointerId,
+          clientX: event.clientX,
+          clientY: event.clientY,
+        };
+        return;
+      }
+
       if (mode === 'erase') {
         const point = {
           ...toPoint(canvas, event),
@@ -293,6 +303,18 @@ export function createDrawingLayer(pageEntries, options) {
     });
 
     canvas.addEventListener('pointermove', (event) => {
+      if (state.touchPan?.pointerId === event.pointerId) {
+        event.preventDefault();
+        const scrollContainer = options.getScrollContainer?.();
+        if (scrollContainer) {
+          scrollContainer.scrollLeft -= event.clientX - state.touchPan.clientX;
+          scrollContainer.scrollTop -= event.clientY - state.touchPan.clientY;
+        }
+        state.touchPan.clientX = event.clientX;
+        state.touchPan.clientY = event.clientY;
+        return;
+      }
+
       if (
         !state.currentStroke ||
         event.pointerId !== state.activePointerId ||
@@ -306,8 +328,16 @@ export function createDrawingLayer(pageEntries, options) {
       redrawPage(pageEntry);
     });
 
-    canvas.addEventListener('pointerup', finalizeStroke);
-    canvas.addEventListener('pointercancel', finalizeStroke);
+    function finishPointer(event) {
+      if (state.touchPan?.pointerId === event.pointerId) {
+        state.touchPan = null;
+        return;
+      }
+      finalizeStroke(event);
+    }
+
+    canvas.addEventListener('pointerup', finishPointer);
+    canvas.addEventListener('pointercancel', finishPointer);
   }
 
   return {
@@ -315,6 +345,7 @@ export function createDrawingLayer(pageEntries, options) {
       state.strokes = structuredClone(strokes);
       state.currentStroke = null;
       state.activePointerId = null;
+      state.touchPan = null;
       redrawAll();
     },
     removeStroke(strokeId) {

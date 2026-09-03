@@ -613,6 +613,7 @@ async function rerenderPages() {
     getHighlights: () => state.sessionAnnotations.highlights,
     getMode: () => state.mode,
     getAllowFingerDrawing: () => state.allowFingerDrawing,
+    getScrollContainer: () => workspaceEl,
     onChange(allStrokes) {
       applySessionAnnotations({
         ...state.sessionAnnotations,
