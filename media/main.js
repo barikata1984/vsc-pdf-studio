@@ -25,6 +25,7 @@ import {
 } from './historyState.js';
 import { icons } from './icons.js';
 import { renderPdf } from './pdfRenderer.js';
+import { startRenderRequest } from './renderMetrics.js';
 import {
   escapeHtml,
   escapeRegExp,
@@ -582,6 +583,7 @@ function requestSave() {
 
 async function rerenderPages() {
   const requestId = ++zoomRenderRequestId;
+  const metrics = startRenderRequest();
   const workspaceSize = {
     width: workspaceEl.clientWidth,
     height: workspaceEl.clientHeight,
@@ -591,14 +593,16 @@ async function rerenderPages() {
     pagesEl,
     getZoomConfig(),
     workspaceSize,
-    state.outlinePdfBase64 || state.pdfBase64
+    state.outlinePdfBase64 || state.pdfBase64,
+    metrics
   );
 
   if (requestId !== zoomRenderRequestId) {
+    metrics.finish('discarded');
     return;
   }
 
-  pagesEl.replaceChildren(fragment);
+  metrics.measure('domReplace', () => pagesEl.replaceChildren(fragment));
   state.pageEntries = pages;
   state.externalOutline = outline;
   syncOutlineState(state);
@@ -644,6 +648,7 @@ async function rerenderPages() {
   updateLayoutState();
   updateInteractionMode();
   restoreZoomViewport();
+  metrics.finish('completed');
 }
 
 function cancelCommentComposer() {

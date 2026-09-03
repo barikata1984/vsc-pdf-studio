@@ -1,9 +1,12 @@
+import { startRenderRequest } from './renderMetrics.js';
+
 export async function renderPdf(
   base64,
   container,
   zoomConfig,
   workspaceSize,
-  outlineBase64 = base64
+  outlineBase64 = base64,
+  metrics = startRenderRequest()
 ) {
   const pdfjsLib = globalThis.pdfjsLib;
   const TextLayerBuilder = globalThis.pdfjsViewer?.TextLayerBuilder;
@@ -11,12 +14,14 @@ export async function renderPdf(
     throw new Error('pdf.js viewer failed to load in the webview.');
   }
 
-  const pdfData = Uint8Array.from(atob(base64), (char) => char.charCodeAt(0));
+  const pdfData = metrics.measure('decode', () =>
+    Uint8Array.from(atob(base64), (char) => char.charCodeAt(0))
+  );
   const loadingTask = pdfjsLib.getDocument({
     data: pdfData,
     disableWorker: true,
   });
-  const pdf = await loadingTask.promise;
+  const pdf = await metrics.measure('getDocument', () => loadingTask.promise);
   let outlinePdf = pdf;
   if (outlineBase64 && outlineBase64 !== base64) {
     const outlinePdfData = Uint8Array.from(atob(outlineBase64), (char) =>
@@ -26,11 +31,16 @@ export async function renderPdf(
       data: outlinePdfData,
       disableWorker: true,
     });
-    outlinePdf = await outlineLoadingTask.promise;
+    outlinePdf = await metrics.measure(
+      'getDocument.outline',
+      () => outlineLoadingTask.promise
+    );
   }
   const firstPage = await pdf.getPage(1);
   const baseViewport = firstPage.getViewport({ scale: 1 });
-  const outline = await buildOutline(outlinePdf);
+  const outline = await metrics.measure('buildOutline', () =>
+    buildOutline(outlinePdf)
+  );
   const resolvedScale = resolveScale(zoomConfig, workspaceSize, {
     width: baseViewport.width,
     height: baseViewport.height,
@@ -97,12 +107,17 @@ export async function renderPdf(
     fragment.append(pageShell);
 
     const pdfContext = pdfCanvas.getContext('2d');
-    await page.render({
-      canvasContext: pdfContext,
-      viewport,
-      transform:
-        outputScale === 1 ? null : [outputScale, 0, 0, outputScale, 0, 0],
-    }).promise;
+    await metrics.measure(
+      'page.render',
+      () =>
+        page.render({
+          canvasContext: pdfContext,
+          viewport,
+          transform:
+            outputScale === 1 ? null : [outputScale, 0, 0, outputScale, 0, 0],
+        }).promise,
+      pageNumber
+    );
 
     const thumbnailCanvas = document.createElement('canvas');
     const thumbnailScale = thumbnailWidth / Math.max(viewport.width, 1);
@@ -114,19 +129,38 @@ export async function renderPdf(
       1,
       Math.round(viewport.height * thumbnailScale)
     );
-    thumbnailCanvas
-      .getContext('2d')
-      .drawImage(
-        pdfCanvas,
-        0,
-        0,
-        thumbnailCanvas.width,
-        thumbnailCanvas.height
-      );
+    metrics.measure(
+      'page.thumbnail',
+      () =>
+        thumbnailCanvas
+          .getContext('2d')
+          .drawImage(
+            pdfCanvas,
+            0,
+            0,
+            thumbnailCanvas.width,
+            thumbnailCanvas.height
+          ),
+      pageNumber
+    );
 
-    const textContentSource = await page.getTextContent();
+    const textContentSource = await metrics.measure(
+      'page.text',
+      () => page.getTextContent(),
+      pageNumber
+    );
     textLayerBuilder.setTextContentSource(textContentSource);
-    await textLayerBuilder.render(viewport);
+    await metrics.measure(
+      'page.text',
+      () => textLayerBuilder.render(viewport),
+      pageNumber
+    );
+
+    const thumbnailDataUrl = metrics.measure(
+      'page.thumbnail',
+      () => thumbnailCanvas.toDataURL('image/png'),
+      pageNumber
+    );
 
     pages.push({
       pageNumber,
@@ -140,7 +174,7 @@ export async function renderPdf(
       textDivs: textLayerBuilder.textDivs,
       textContentItemsStr: textLayerBuilder.textContentItemsStr,
       drawingCanvas,
-      thumbnailDataUrl: thumbnailCanvas.toDataURL('image/png'),
+      thumbnailDataUrl,
       width: viewport.width,
       height: viewport.height,
       pdfWidth: unscaledViewport.width,
@@ -153,6 +187,7 @@ export async function renderPdf(
     outline,
     resolvedScale,
     fragment,
+    metrics,
   };
 }
 
