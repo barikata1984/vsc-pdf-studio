@@ -27,6 +27,7 @@ import { icons } from './icons.js';
 import {
   createPdfRenderSession,
   getBufferedPageNumbers,
+  getPrioritizedPageNumbers,
 } from './pdfRenderer.js';
 import { startRenderRequest } from './renderMetrics.js';
 import {
@@ -91,6 +92,7 @@ const state = {
   outline: [],
   searchOpen: false,
   searchQuery: '',
+  searchTextIndex: [],
   searchMatches: [],
   activeSearchMatchIndex: -1,
   colorPopoverOwner: null,
@@ -257,6 +259,7 @@ let pdfRenderSession = null;
 let pdfRenderSessionPromise = null;
 let pageRenderObserver = null;
 let searchPreparationId = 0;
+let thumbnailPreparationPromise = null;
 
 const autoSaver = createAutoSaver(() => {
   requestSave();
@@ -284,6 +287,7 @@ sidebarController = createSidebarController({
   icons,
   jumpToPage: (...args) => viewportController.jumpToPage(...args),
   getPageScrollTop: (...args) => viewportController.getPageScrollTop(...args),
+  preparePageThumbnails,
 });
 
 const searchController = createSearchController({
@@ -301,6 +305,7 @@ const searchController = createSearchController({
     viewportController.updateCurrentPageFromScroll(...args),
   updatePageIndicator: (...args) =>
     viewportController.updatePageIndicator(...args),
+  ensurePageRendered,
 });
 
 const formsController = createFormController({
@@ -589,33 +594,84 @@ function requestSave() {
 }
 
 async function renderPageNumbers(pageNumbers, session, metrics) {
-  const requestedPages = new Set(pageNumbers);
+  const renderRequestId = session.prioritizePages(pageNumbers);
   const results = await Promise.all(
-    state.pageEntries
-      .filter((pageEntry) => requestedPages.has(pageEntry.pageNumber))
+    pageNumbers
+      .map((pageNumber) =>
+        state.pageEntries.find(
+          (pageEntry) => pageEntry.pageNumber === pageNumber
+        )
+      )
+      .filter(Boolean)
       .map(async (pageEntry) => {
         drawingLayer?.ensurePageCanvas(pageEntry);
-        return session.renderPage(pageEntry, metrics);
+        return session.renderPage(pageEntry, metrics, renderRequestId);
       })
   );
-  return results.every(Boolean);
+  const completed = results.every(Boolean);
+  if (completed && state.searchQuery.trim() && state.searchTextIndex.length) {
+    updateSearchResults({ preserveActive: true });
+  }
+  return completed;
+}
+
+async function ensurePageRendered(pageNumber) {
+  const session = pdfRenderSession;
+  const pageEntries = state.pageEntries;
+  if (!session) {
+    return false;
+  }
+
+  const metrics = startRenderRequest();
+  try {
+    const completed = await renderPageNumbers(
+      getPrioritizedPageNumbers(
+        [pageNumber],
+        state.totalPages,
+        pageNumber < state.currentPage ? -1 : 1
+      ),
+      session,
+      metrics
+    );
+    const isCurrent =
+      completed &&
+      session === pdfRenderSession &&
+      pageEntries === state.pageEntries;
+    metrics.finish(isCurrent ? 'completed' : 'discarded');
+    return isCurrent;
+  } catch (error) {
+    metrics.finish('discarded');
+    console.error('Failed to render PDF search result.', error);
+    return false;
+  }
 }
 
 function observePageRendering(session) {
   pageRenderObserver?.disconnect();
+  let lastScrollTop = workspaceEl.scrollTop;
+  const visiblePageNumbers = new Set();
   const observer = new IntersectionObserver(
     (entries) => {
       if (observer !== pageRenderObserver || session !== pdfRenderSession) {
         return;
       }
-      const visiblePageNumbers = entries
-        .filter((entry) => entry.isIntersecting)
-        .map((entry) => Number(entry.target.dataset.pageNumber));
-      const pageNumbers = getBufferedPageNumbers(
-        visiblePageNumbers,
-        state.totalPages
+      for (const entry of entries) {
+        const pageNumber = Number(entry.target.dataset.pageNumber);
+        if (entry.isIntersecting) {
+          visiblePageNumbers.add(pageNumber);
+        } else {
+          visiblePageNumbers.delete(pageNumber);
+        }
+      }
+      const nextScrollTop = workspaceEl.scrollTop;
+      const pageNumbers = getPrioritizedPageNumbers(
+        [...visiblePageNumbers],
+        state.totalPages,
+        nextScrollTop < lastScrollTop ? -1 : 1
       );
+      lastScrollTop = nextScrollTop;
       if (!pageNumbers.length) {
+        session.prioritizePages([]);
         return;
       }
 
@@ -674,15 +730,15 @@ async function refreshSearchResults(options = {}) {
 
   const metrics = startRenderRequest();
   try {
-    const completed = await session.ensureTextLayers(pageEntries, metrics);
+    const textIndex = await session.prepareTextIndex(pageEntries, metrics);
     const isCurrent =
-      completed &&
       preparationId === searchPreparationId &&
       session === pdfRenderSession &&
       pageEntries === state.pageEntries &&
       query === state.searchQuery.trim();
     metrics.finish(isCurrent ? 'completed' : 'discarded');
     if (isCurrent) {
+      state.searchTextIndex = textIndex;
       updateSearchResults(options);
     }
   } catch (error) {
@@ -691,6 +747,75 @@ async function refreshSearchResults(options = {}) {
       console.error('Failed to prepare PDF search.', error);
     }
   }
+}
+
+function pageThumbnailsRequested() {
+  return state.sidebarOpen && state.sidebarTab === 'pages';
+}
+
+function preparePageThumbnails() {
+  if (
+    thumbnailPreparationPromise ||
+    !pdfRenderSession ||
+    !pageThumbnailsRequested()
+  ) {
+    return thumbnailPreparationPromise;
+  }
+
+  const session = pdfRenderSession;
+  const metrics = startRenderRequest();
+  const promise = (async () => {
+    for (let pageNumber = 1; pageNumber <= session.pageCount; pageNumber += 1) {
+      if (!pageThumbnailsRequested()) {
+        return false;
+      }
+      const dataUrl = await session.renderThumbnail(pageNumber, 92, metrics);
+      if (session !== pdfRenderSession) {
+        return false;
+      }
+      if (dataUrl) {
+        const pageEntry = state.pageEntries.find(
+          (entry) => entry.pageNumber === pageNumber
+        );
+        if (pageEntry) {
+          pageEntry.thumbnailDataUrl = dataUrl;
+        }
+        const placeholder = pageListEl.querySelector(
+          `.sidebar-item[data-page="${pageNumber}"] .page-nav-thumb`
+        );
+        if (placeholder?.tagName === 'IMG') {
+          placeholder.src = dataUrl;
+        } else if (placeholder) {
+          const image = document.createElement('img');
+          image.className = 'page-nav-thumb';
+          image.src = dataUrl;
+          image.alt = `Page ${pageNumber} preview`;
+          placeholder.replaceWith(image);
+        }
+      }
+      if (!pageThumbnailsRequested()) {
+        return false;
+      }
+    }
+    return true;
+  })();
+  thumbnailPreparationPromise = promise;
+  void promise
+    .then((completed) => {
+      metrics.finish(completed ? 'completed' : 'discarded');
+    })
+    .catch((error) => {
+      metrics.finish('discarded');
+      if (session === pdfRenderSession) {
+        console.error('Failed to render PDF thumbnails.', error);
+      }
+    })
+    .finally(() => {
+      if (thumbnailPreparationPromise === promise) {
+        thumbnailPreparationPromise = null;
+      }
+    });
+  return promise;
 }
 
 async function getPdfRenderSession(metrics) {
@@ -793,6 +918,7 @@ async function rerenderPages() {
     return;
   }
 
+  preparePageThumbnails();
   void refreshSearchResults({ preserveActive: true });
   metrics.finish(completed ? 'completed' : 'discarded');
 }
@@ -1381,8 +1507,10 @@ window.addEventListener('message', async (event) => {
     void pendingSession
       ?.then((session) => session.destroy())
       .catch((error) => console.error('Failed to dispose PDF session.', error));
-    await pdfRenderSession?.destroy();
+    const currentSession = pdfRenderSession;
     pdfRenderSession = null;
+    thumbnailPreparationPromise = null;
+    await currentSession?.destroy();
     state.fileName = message.payload.fileName;
     state.commentAuthor = message.payload.commentAuthor || 'PDF Studio';
     state.allowFingerDrawing = Boolean(message.payload.allowFingerDrawing);
@@ -1405,6 +1533,7 @@ window.addEventListener('message', async (event) => {
     state.selectionAction = null;
     state.searchOpen = false;
     state.searchQuery = '';
+    state.searchTextIndex = [];
     state.searchMatches = [];
     state.activeSearchMatchIndex = -1;
     state.pageLayout = 'single';

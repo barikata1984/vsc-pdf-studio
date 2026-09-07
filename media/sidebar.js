@@ -14,6 +14,7 @@ export function createSidebarController({
   icons,
   jumpToPage,
   getPageScrollTop,
+  preparePageThumbnails,
 }) {
   function getOutlineKey(item, path) {
     return `${path.join('.')}:${item.pageNumber ?? ''}:${item.title}`;
@@ -265,6 +266,9 @@ export function createSidebarController({
     state.sidebarTab = nextTab;
     updateSidebarTabUI();
     updateSidebarActiveState({ reveal: true });
+    if (state.sidebarOpen && nextTab === 'pages') {
+      preparePageThumbnails();
+    }
   }
 
   function setSidebarOpen(nextOpen) {
@@ -276,6 +280,9 @@ export function createSidebarController({
     if (nextOpen) {
       updateSidebarTabUI();
       updateSidebarActiveState({ reveal: true });
+      if (state.sidebarTab === 'pages') {
+        preparePageThumbnails();
+      }
     }
   }
 

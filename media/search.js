@@ -1,3 +1,5 @@
+import { findInTextIndex } from './textIndex.js';
+
 export function createSearchController({
   state,
   workspaceEl,
@@ -11,6 +13,7 @@ export function createSearchController({
   getPageScrollTop,
   updateCurrentPageFromScroll,
   updatePageIndicator,
+  ensurePageRendered,
 }) {
   function renderSearchHighlights() {
     for (const pageEntry of state.pageEntries) {
@@ -61,90 +64,42 @@ export function createSearchController({
     searchNextEl.disabled = total === 0;
   }
 
-  function computePageSearchMatches(pageEntry, query) {
-    const textItems = pageEntry.textContentItemsStr ?? [];
+  function computeMatchRects(pageEntry, indexedPage, match) {
     const textDivs = pageEntry.textDivs ?? [];
-    if (!textItems.length || !textDivs.length) {
+    if (!indexedPage?.items.length || !textDivs.length) {
       return [];
     }
 
-    const pageText = textItems.join('');
-    const normalizedQuery = query.toLocaleLowerCase();
-    const normalizedText = pageText.toLocaleLowerCase();
-    const matches = [];
-    const starts = [];
-    let total = 0;
-    for (const item of textItems) {
-      starts.push(total);
-      total += item.length;
+    const startItem = indexedPage.items.find(
+      (item) => item.start <= match.start && match.start < item.end
+    );
+    const endOffset = Math.max(match.start, match.end - 1);
+    const endItem = indexedPage.items.find(
+      (item) => item.start <= endOffset && endOffset < item.end
+    );
+    if (!startItem || !endItem) {
+      return [];
+    }
+    const startNode = findTextNode(textDivs[startItem.index]);
+    const endNode = findTextNode(textDivs[endItem.index]);
+    if (!startNode || !endNode) {
+      return [];
     }
 
-    function findItemIndex(offset) {
-      let low = 0;
-      let high = starts.length - 1;
-      while (low <= high) {
-        const mid = (low + high) >> 1;
-        const start = starts[mid];
-        const end = start + textItems[mid].length;
-        if (offset < start) {
-          high = mid - 1;
-        } else if (offset >= end) {
-          low = mid + 1;
-        } else {
-          return mid;
-        }
-      }
-      return -1;
-    }
-
-    let searchIndex = 0;
-    while (searchIndex <= normalizedText.length) {
-      const matchIndex = normalizedText.indexOf(normalizedQuery, searchIndex);
-      if (matchIndex === -1) {
-        break;
-      }
-
-      const endIndex = matchIndex + normalizedQuery.length;
-      const startItemIndex = findItemIndex(matchIndex);
-      const endItemIndex = findItemIndex(Math.max(matchIndex, endIndex - 1));
-      if (startItemIndex === -1 || endItemIndex === -1) {
-        searchIndex = matchIndex + 1;
-        continue;
-      }
-
-      const startNode = findTextNode(textDivs[startItemIndex]);
-      const endNode = findTextNode(textDivs[endItemIndex]);
-      if (!startNode || !endNode) {
-        searchIndex = matchIndex + 1;
-        continue;
-      }
-
-      const range = document.createRange();
-      range.setStart(startNode, matchIndex - starts[startItemIndex]);
-      range.setEnd(endNode, endIndex - starts[endItemIndex]);
-      const layerRect = pageEntry.textLayer.getBoundingClientRect();
-      const scaleX = pageEntry.width / Math.max(layerRect.width, 1);
-      const scaleY = pageEntry.height / Math.max(layerRect.height, 1);
-      const rects = Array.from(range.getClientRects())
-        .filter((rect) => rect.width > 0 && rect.height > 0)
-        .map((rect) => ({
-          x: (rect.left - layerRect.left) * scaleX,
-          y: (rect.top - layerRect.top) * scaleY,
-          width: rect.width * scaleX,
-          height: rect.height * scaleY,
-        }));
-
-      if (rects.length) {
-        matches.push({
-          pageNumber: pageEntry.pageNumber,
-          rects,
-        });
-      }
-
-      searchIndex = matchIndex + Math.max(normalizedQuery.length, 1);
-    }
-
-    return matches;
+    const range = document.createRange();
+    range.setStart(startNode, match.start - startItem.start);
+    range.setEnd(endNode, match.end - endItem.start);
+    const layerRect = pageEntry.textLayer.getBoundingClientRect();
+    const scaleX = pageEntry.width / Math.max(layerRect.width, 1);
+    const scaleY = pageEntry.height / Math.max(layerRect.height, 1);
+    return Array.from(range.getClientRects())
+      .filter((rect) => rect.width > 0 && rect.height > 0)
+      .map((rect) => ({
+        x: (rect.left - layerRect.left) * scaleX,
+        y: (rect.top - layerRect.top) * scaleY,
+        width: rect.width * scaleX,
+        height: rect.height * scaleY,
+      }));
   }
 
   function updateSearchResults(options = {}) {
@@ -160,9 +115,27 @@ export function createSearchController({
     const previousMatch = options.preserveActive
       ? state.searchMatches[state.activeSearchMatchIndex]
       : null;
-    state.searchMatches = state.pageEntries.flatMap((pageEntry) =>
-      computePageSearchMatches(pageEntry, query)
+    const indexedPages = new Map(
+      (state.searchTextIndex ?? []).map((page) => [page.pageNumber, page])
     );
+    state.searchMatches = findInTextIndex(
+      state.searchTextIndex ?? [],
+      query
+    ).map((match) => {
+      const pageEntry = state.pageEntries.find(
+        (entry) => entry.pageNumber === match.pageNumber
+      );
+      return {
+        ...match,
+        rects: pageEntry
+          ? computeMatchRects(
+              pageEntry,
+              indexedPages.get(match.pageNumber),
+              match
+            )
+          : [],
+      };
+    });
 
     if (!state.searchMatches.length) {
       state.activeSearchMatchIndex = -1;
@@ -170,9 +143,7 @@ export function createSearchController({
       const restoredIndex = state.searchMatches.findIndex(
         (match) =>
           match.pageNumber === previousMatch.pageNumber &&
-          Math.abs(
-            (match.rects[0]?.y ?? 0) - (previousMatch.rects[0]?.y ?? 0)
-          ) < 1
+          match.start === previousMatch.start
       );
       state.activeSearchMatchIndex = restoredIndex >= 0 ? restoredIndex : 0;
     } else if (
@@ -186,23 +157,43 @@ export function createSearchController({
     updateSearchUI();
   }
 
-  function revealSearchMatch(index) {
-    const match = state.searchMatches[index];
+  async function revealSearchMatch(index) {
+    let match = state.searchMatches[index];
     if (!match) {
       return;
     }
 
-    const pageEntry = state.pageEntries.find(
+    let pageEntry = state.pageEntries.find(
       (entry) => entry.pageNumber === match.pageNumber
     );
-    if (!pageEntry || !match.rects.length) {
+    if (!pageEntry) {
       return;
+    }
+    if (!match.rects.length) {
+      const requestedMatch = match;
+      const rendered = await ensurePageRendered(match.pageNumber);
+      match = state.searchMatches[index];
+      if (
+        !rendered ||
+        state.activeSearchMatchIndex !== index ||
+        match?.pageNumber !== requestedMatch.pageNumber ||
+        match?.start !== requestedMatch.start ||
+        match?.end !== requestedMatch.end
+      ) {
+        return;
+      }
+      pageEntry = state.pageEntries.find(
+        (entry) => entry.pageNumber === match?.pageNumber
+      );
+      if (!match || !pageEntry) {
+        return;
+      }
     }
 
     state.pageJumpInProgress = true;
     state.currentPage = match.pageNumber;
     updatePageIndicator();
-    const rect = match.rects[0];
+    const rect = match.rects[0] ?? { x: 0, y: 0 };
     workspaceEl.scrollTo({
       top: getPageScrollTop(pageEntry) + Math.max(0, rect.y - 32),
       left: Math.max(0, rect.x - 24),
@@ -227,7 +218,7 @@ export function createSearchController({
     state.activeSearchMatchIndex = nextIndex;
     renderSearchHighlights();
     updateSearchUI();
-    revealSearchMatch(nextIndex);
+    void revealSearchMatch(nextIndex);
   }
 
   return {

@@ -1,4 +1,5 @@
 import { startRenderRequest } from './renderMetrics.js';
+import { buildTextIndex } from './textIndex.js';
 
 export function getBufferedPageNumbers(
   visiblePageNumbers,
@@ -18,6 +19,31 @@ export function getBufferedPageNumbers(
     }
   }
   return [...pages].sort((left, right) => left - right);
+}
+
+export function getPrioritizedPageNumbers(
+  visiblePageNumbers,
+  pageCount,
+  direction,
+  bufferPages = 1
+) {
+  const pages = getBufferedPageNumbers(
+    visiblePageNumbers,
+    pageCount,
+    bufferPages
+  );
+  return pages.sort((left, right) => {
+    const leftDistance = Math.min(
+      ...visiblePageNumbers.map((pageNumber) => Math.abs(left - pageNumber))
+    );
+    const rightDistance = Math.min(
+      ...visiblePageNumbers.map((pageNumber) => Math.abs(right - pageNumber))
+    );
+    return (
+      leftDistance - rightDistance ||
+      (direction < 0 ? left - right : right - left)
+    );
+  });
 }
 
 export async function createPdfRenderSession(
@@ -40,7 +66,6 @@ export async function createPdfRenderSession(
       () =>
         pdfjsLib.getDocument({
           data,
-          disableWorker: true,
         }).promise
     );
   };
@@ -62,14 +87,80 @@ export async function createPdfRenderSession(
     buildOutline(outlinePdf)
   );
   let generation = 0;
-  const activeRenderTasks = new Set();
+  const activeRenderTasks = new Map();
+  const activeTextLayers = new Map();
+  const activeThumbnailTasks = new Set();
+  const thumbnailDataUrls = new Map();
+  const thumbnailPromises = new Map();
+  const textContents = new Map();
+  const textContentPromises = new Map();
+  let textIndexPromise = null;
+  const foregroundRenderWaiters = [];
+  const backgroundRenderWaiters = [];
+  let activeRenderCount = 0;
+  let renderRequestId = 0;
+  let requestedPageNumbers = new Set();
+  let destroyed = false;
+
+  async function withRenderSlot(run, background = false) {
+    if (activeRenderCount < 2) {
+      activeRenderCount += 1;
+    } else {
+      await new Promise((resolve) =>
+        (background ? backgroundRenderWaiters : foregroundRenderWaiters).push(
+          resolve
+        )
+      );
+    }
+    try {
+      return await run();
+    } finally {
+      const next =
+        foregroundRenderWaiters.shift() ?? backgroundRenderWaiters.shift();
+      if (next) {
+        next();
+      } else {
+        activeRenderCount -= 1;
+      }
+    }
+  }
 
   function cancelRendering() {
     generation += 1;
-    for (const task of activeRenderTasks) {
+    for (const task of activeRenderTasks.keys()) {
       task.cancel();
     }
     activeRenderTasks.clear();
+    for (const textLayerBuilder of activeTextLayers.keys()) {
+      textLayerBuilder.cancel();
+    }
+    activeTextLayers.clear();
+  }
+
+  function prioritizePages(pageNumbers) {
+    renderRequestId += 1;
+    requestedPageNumbers = new Set(pageNumbers);
+    for (const [task, pageEntry] of activeRenderTasks) {
+      if (!requestedPageNumbers.has(pageEntry.pageNumber)) {
+        task.cancel();
+      }
+    }
+    for (const [textLayerBuilder, pageEntry] of activeTextLayers) {
+      if (!requestedPageNumbers.has(pageEntry.pageNumber)) {
+        textLayerBuilder.cancel();
+      }
+    }
+    return renderRequestId;
+  }
+
+  function isPageRenderCurrent(pageEntry, entryGeneration) {
+    return (
+      !destroyed &&
+      entryGeneration === generation &&
+      (pageEntry.renderRequestId === null ||
+        (pageEntry.renderRequestId === renderRequestId &&
+          requestedPageNumbers.has(pageEntry.pageNumber)))
+    );
   }
 
   function createLayout(zoomConfig, workspaceSize) {
@@ -154,7 +245,7 @@ export async function createPdfRenderSession(
         textDivs: [],
         textContentItemsStr: [],
         drawingCanvas,
-        thumbnailDataUrl: '',
+        thumbnailDataUrl: thumbnailDataUrls.get(pageNumber) ?? '',
         width: viewport.width,
         height: viewport.height,
         pdfWidth: unscaledViewport.width,
@@ -165,6 +256,7 @@ export async function createPdfRenderSession(
         renderState: 'idle',
         renderPromise: null,
         renderTask: null,
+        renderRequestId: null,
       });
     }
 
@@ -176,31 +268,61 @@ export async function createPdfRenderSession(
     };
   }
 
+  async function getTextContent(pageEntry, pageMetrics) {
+    const { pageNumber } = pageEntry;
+    if (textContents.has(pageNumber)) {
+      return textContents.get(pageNumber);
+    }
+    if (!textContentPromises.has(pageNumber)) {
+      textContentPromises.set(
+        pageNumber,
+        pageMetrics.measure(
+          'page.text',
+          () => pageEntry.page.getTextContent(),
+          pageNumber
+        )
+      );
+    }
+    try {
+      const textContent = await textContentPromises.get(pageNumber);
+      textContents.set(pageNumber, textContent);
+      return textContent;
+    } finally {
+      textContentPromises.delete(pageNumber);
+    }
+  }
+
   async function ensureTextLayer(pageEntry, pageMetrics = metrics) {
-    if (pageEntry.generation !== generation) {
+    const entryGeneration = pageEntry.generation;
+    if (!isPageRenderCurrent(pageEntry, entryGeneration)) {
       return false;
     }
     if (pageEntry.textReady) {
       return true;
     }
     if (!pageEntry.textPromise) {
-      const entryGeneration = pageEntry.generation;
-      pageEntry.textPromise = (async () => {
-        const textContentSource = await pageMetrics.measure(
-          'page.text',
-          () => pageEntry.page.getTextContent(),
-          pageEntry.pageNumber
-        );
-        if (entryGeneration !== generation) {
+      const textPromise = (async () => {
+        const textContentSource = await getTextContent(pageEntry, pageMetrics);
+        if (!isPageRenderCurrent(pageEntry, entryGeneration)) {
           return false;
         }
         pageEntry.textLayerBuilder.setTextContentSource(textContentSource);
-        await pageMetrics.measure(
-          'page.text',
-          () => pageEntry.textLayerBuilder.render(pageEntry.viewport),
-          pageEntry.pageNumber
-        );
-        if (entryGeneration !== generation) {
+        activeTextLayers.set(pageEntry.textLayerBuilder, pageEntry);
+        try {
+          await pageMetrics.measure(
+            'page.text',
+            () => pageEntry.textLayerBuilder.render(pageEntry.viewport),
+            pageEntry.pageNumber
+          );
+        } catch (error) {
+          if (!isPageRenderCurrent(pageEntry, entryGeneration)) {
+            return false;
+          }
+          throw error;
+        } finally {
+          activeTextLayers.delete(pageEntry.textLayerBuilder);
+        }
+        if (!isPageRenderCurrent(pageEntry, entryGeneration)) {
           return false;
         }
         pageEntry.textDivs = pageEntry.textLayerBuilder.textDivs;
@@ -209,14 +331,27 @@ export async function createPdfRenderSession(
         pageEntry.textReady = true;
         return true;
       })();
+      pageEntry.textPromise = textPromise;
+      try {
+        return await textPromise;
+      } finally {
+        if (pageEntry.textPromise === textPromise && !pageEntry.textReady) {
+          pageEntry.textPromise = null;
+        }
+      }
     }
     return pageEntry.textPromise;
   }
 
-  async function renderPage(pageEntry, pageMetrics = metrics) {
+  async function renderPage(
+    pageEntry,
+    pageMetrics = metrics,
+    pageRenderRequestId = null
+  ) {
     if (pageEntry.generation !== generation) {
       return false;
     }
+    pageEntry.renderRequestId = pageRenderRequestId;
     if (pageEntry.renderState === 'rendered') {
       return true;
     }
@@ -227,49 +362,62 @@ export async function createPdfRenderSession(
     const entryGeneration = pageEntry.generation;
     pageEntry.renderState = 'rendering';
     const renderPromise = (async () => {
-      pageEntry.pdfCanvas.width = Math.max(
-        1,
-        Math.floor(pageEntry.width * pageEntry.outputScale)
-      );
-      pageEntry.pdfCanvas.height = Math.max(
-        1,
-        Math.floor(pageEntry.height * pageEntry.outputScale)
-      );
-      const renderTask = pageEntry.page.render({
-        canvasContext: pageEntry.pdfCanvas.getContext('2d'),
-        viewport: pageEntry.viewport,
-        transform:
-          pageEntry.outputScale === 1
-            ? null
-            : [pageEntry.outputScale, 0, 0, pageEntry.outputScale, 0, 0],
-      });
-      pageEntry.renderTask = renderTask;
-      activeRenderTasks.add(renderTask);
-      try {
-        await pageMetrics.measure(
-          'page.render',
-          () => renderTask.promise,
-          pageEntry.pageNumber
-        );
-      } catch (error) {
-        if (
-          entryGeneration !== generation ||
-          error?.name === 'RenderingCancelledException'
-        ) {
+      const rendered = await withRenderSlot(async () => {
+        if (!isPageRenderCurrent(pageEntry, entryGeneration)) {
           return false;
         }
-        throw error;
-      } finally {
-        activeRenderTasks.delete(renderTask);
-        if (pageEntry.renderTask === renderTask) {
-          pageEntry.renderTask = null;
+        pageEntry.pdfCanvas.width = Math.max(
+          1,
+          Math.floor(pageEntry.width * pageEntry.outputScale)
+        );
+        pageEntry.pdfCanvas.height = Math.max(
+          1,
+          Math.floor(pageEntry.height * pageEntry.outputScale)
+        );
+        const renderTask = pageEntry.page.render({
+          canvasContext: pageEntry.pdfCanvas.getContext('2d'),
+          viewport: pageEntry.viewport,
+          transform:
+            pageEntry.outputScale === 1
+              ? null
+              : [pageEntry.outputScale, 0, 0, pageEntry.outputScale, 0, 0],
+        });
+        pageEntry.renderTask = renderTask;
+        activeRenderTasks.set(renderTask, pageEntry);
+        try {
+          await pageMetrics.measure(
+            'page.render',
+            () => renderTask.promise,
+            pageEntry.pageNumber
+          );
+        } catch (error) {
+          if (
+            entryGeneration !== generation ||
+            error?.name === 'RenderingCancelledException'
+          ) {
+            return false;
+          }
+          throw error;
+        } finally {
+          activeRenderTasks.delete(renderTask);
+          if (pageEntry.renderTask === renderTask) {
+            pageEntry.renderTask = null;
+          }
         }
+        return entryGeneration === generation;
+      });
+
+      if (!rendered) {
+        return false;
       }
 
-      if (
-        entryGeneration !== generation ||
-        !(await ensureTextLayer(pageEntry, pageMetrics))
-      ) {
+      if (!isPageRenderCurrent(pageEntry, entryGeneration)) {
+        return false;
+      }
+      if (!(await ensureTextLayer(pageEntry, pageMetrics))) {
+        return false;
+      }
+      if (!isPageRenderCurrent(pageEntry, entryGeneration)) {
         return false;
       }
       pageEntry.renderState = 'rendered';
@@ -290,13 +438,91 @@ export async function createPdfRenderSession(
     }
   }
 
-  async function ensureTextLayers(pageEntries, pageMetrics = metrics) {
-    for (const pageEntry of pageEntries) {
-      if (!(await ensureTextLayer(pageEntry, pageMetrics))) {
-        return false;
-      }
+  async function prepareTextIndex(pageEntries, pageMetrics = metrics) {
+    if (!textIndexPromise) {
+      textIndexPromise = (async () => {
+        const indexedPages = [];
+        for (const pageEntry of pageEntries) {
+          indexedPages.push({
+            pageNumber: pageEntry.pageNumber,
+            textContent: await getTextContent(pageEntry, pageMetrics),
+          });
+        }
+        return buildTextIndex(indexedPages);
+      })();
     }
-    return true;
+
+    const index = await textIndexPromise;
+    for (const pageEntry of pageEntries) {
+      if (pageEntry.generation !== generation) {
+        continue;
+      }
+      pageEntry.textContentItemsStr = (
+        textContents.get(pageEntry.pageNumber)?.items ?? []
+      ).map((item) => (typeof item?.str === 'string' ? item.str : ''));
+    }
+    return index;
+  }
+
+  async function renderThumbnail(
+    pageNumber,
+    width = 92,
+    pageMetrics = metrics
+  ) {
+    if (thumbnailDataUrls.has(pageNumber)) {
+      return thumbnailDataUrls.get(pageNumber);
+    }
+    if (thumbnailPromises.has(pageNumber)) {
+      return thumbnailPromises.get(pageNumber);
+    }
+
+    const page = pages[pageNumber - 1];
+    const pageSize = pageSizes[pageNumber - 1];
+    if (!page || !pageSize) {
+      throw new RangeError(`Unknown PDF page ${pageNumber}.`);
+    }
+
+    const promise = withRenderSlot(async () => {
+      if (destroyed) {
+        return '';
+      }
+      const viewport = page.getViewport({ scale: width / pageSize.width });
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.max(1, Math.round(viewport.width));
+      canvas.height = Math.max(1, Math.round(viewport.height));
+      const renderTask = page.render({
+        canvasContext: canvas.getContext('2d'),
+        viewport,
+      });
+      activeThumbnailTasks.add(renderTask);
+      try {
+        await pageMetrics.measure(
+          'page.thumbnail',
+          () => renderTask.promise,
+          pageNumber
+        );
+      } catch (error) {
+        if (error?.name === 'RenderingCancelledException') {
+          return '';
+        }
+        throw error;
+      } finally {
+        activeThumbnailTasks.delete(renderTask);
+      }
+      const dataUrl = pageMetrics.measure(
+        'page.thumbnail',
+        () => canvas.toDataURL('image/png'),
+        pageNumber
+      );
+      thumbnailDataUrls.set(pageNumber, dataUrl);
+      return dataUrl;
+    }, true);
+    thumbnailPromises.set(pageNumber, promise);
+    try {
+      return await promise;
+    } finally {
+      thumbnailPromises.delete(pageNumber);
+    }
   }
 
   return {
@@ -306,10 +532,17 @@ export async function createPdfRenderSession(
     outline,
     createLayout,
     renderPage,
-    ensureTextLayers,
+    prioritizePages,
+    renderThumbnail,
+    prepareTextIndex,
     cancelRendering,
     async destroy() {
+      destroyed = true;
       cancelRendering();
+      for (const task of activeThumbnailTasks) {
+        task.cancel();
+      }
+      activeThumbnailTasks.clear();
       await pdf.destroy();
       if (outlinePdf !== pdf) {
         await outlinePdf.destroy();

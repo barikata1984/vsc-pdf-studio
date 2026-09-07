@@ -259,6 +259,7 @@ class PdfEditorProvider {
         const toWebviewUri = (segments) => webview
             .asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, ...segments))
             .toString();
+        const pdfWorkerUri = toWebviewUri(['media', 'libs', 'pdf.worker.min.js']);
         const html = [
             '<!DOCTYPE html>',
             '<html lang="en">',
@@ -267,8 +268,8 @@ class PdfEditorProvider {
             `  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${webview.cspSource} blob: data:; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}' ${webview.cspSource}; worker-src ${webview.cspSource} blob:; font-src ${webview.cspSource};">`,
             '  <meta name="viewport" content="width=device-width, initial-scale=1.0" />',
             `  <link rel="stylesheet" href="${toWebviewUri(['media', 'styles.css'])}" />`,
-            `  <script nonce="${nonce}" src="${toWebviewUri(['media', 'libs', 'pdf.worker.min.js'])}"></script>`,
             `  <script nonce="${nonce}" src="${toWebviewUri(['media', 'libs', 'pdf.min.js'])}"></script>`,
+            `  <script nonce="${nonce}">globalThis.pdfjsLib.GlobalWorkerOptions.workerSrc = ${JSON.stringify(pdfWorkerUri)};</script>`,
             `  <script nonce="${nonce}" src="${toWebviewUri(['media', 'libs', 'pdf_viewer.js'])}"></script>`,
             '</head>',
             '<body>',
