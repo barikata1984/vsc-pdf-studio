@@ -41,7 +41,11 @@ import {
 import { createSearchController } from './search.js';
 import { createSelectionController } from './selection.js';
 import { createSidebarController } from './sidebar.js';
-import { createViewportController } from './viewport.js';
+import {
+  createViewportController,
+  getCurrentPageNumber,
+  getCurrentPageRootMargin,
+} from './viewport.js';
 
 const vscode = acquireVsCodeApi();
 const app = document.querySelector('#app');
@@ -61,7 +65,6 @@ const state = {
   color: '#ef4444',
   mode: 'select',
   menuOpen: false,
-  pageJumpInProgress: false,
   zoomContext: null,
   gestureZoomBase: null,
   sessionAnnotations: {
@@ -258,6 +261,8 @@ let resizeRerenderTimer = null;
 let pdfRenderSession = null;
 let pdfRenderSessionPromise = null;
 let pageRenderObserver = null;
+let currentPageObserver = null;
+let retainedRenderPageNumbers = [];
 let searchPreparationId = 0;
 let thumbnailPreparationPromise = null;
 
@@ -301,8 +306,6 @@ const searchController = createSearchController({
   searchNextEl,
   findTextNode,
   getPageScrollTop: (...args) => viewportController.getPageScrollTop(...args),
-  updateCurrentPageFromScroll: (...args) =>
-    viewportController.updateCurrentPageFromScroll(...args),
   updatePageIndicator: (...args) =>
     viewportController.updatePageIndicator(...args),
   ensurePageRendered,
@@ -419,7 +422,7 @@ interactionController = createInteractionController({
 const {
   updatePageIndicator,
   updateZoomPresetIndicator,
-  updateCurrentPageFromScroll,
+  setCurrentPage,
   setActiveColor,
   getCommentOverlayPlacement,
   jumpToPage,
@@ -595,6 +598,7 @@ function requestSave() {
 
 async function renderPageNumbers(pageNumbers, session, metrics) {
   const renderRequestId = session.prioritizePages(pageNumbers);
+  session.releasePagesExcept(pageNumbers);
   const results = await Promise.all(
     pageNumbers
       .map((pageNumber) =>
@@ -624,12 +628,13 @@ async function ensurePageRendered(pageNumber) {
 
   const metrics = startRenderRequest();
   try {
+    const targetPageNumbers = getPrioritizedPageNumbers(
+      [pageNumber],
+      state.totalPages,
+      pageNumber < state.currentPage ? -1 : 1
+    );
     const completed = await renderPageNumbers(
-      getPrioritizedPageNumbers(
-        [pageNumber],
-        state.totalPages,
-        pageNumber < state.currentPage ? -1 : 1
-      ),
+      [...new Set([...targetPageNumbers, ...retainedRenderPageNumbers])],
       session,
       metrics
     );
@@ -643,6 +648,42 @@ async function ensurePageRendered(pageNumber) {
     metrics.finish('discarded');
     console.error('Failed to render PDF search result.', error);
     return false;
+  }
+}
+
+function observeCurrentPage(session) {
+  currentPageObserver?.disconnect();
+  const centeredPageNumbers = new Set();
+  const observer = new IntersectionObserver(
+    (entries) => {
+      if (observer !== currentPageObserver || session !== pdfRenderSession) {
+        return;
+      }
+      for (const entry of entries) {
+        const pageNumber = Number(entry.target.dataset.pageNumber);
+        if (entry.isIntersecting) {
+          centeredPageNumbers.add(pageNumber);
+        } else {
+          centeredPageNumbers.delete(pageNumber);
+        }
+      }
+      const pageNumber = getCurrentPageNumber(
+        [...centeredPageNumbers],
+        state.pageLayout
+      );
+      if (pageNumber !== null) {
+        setCurrentPage(pageNumber);
+      }
+    },
+    {
+      root: workspaceEl,
+      rootMargin: getCurrentPageRootMargin(workspaceEl.clientHeight),
+    }
+  );
+  currentPageObserver = observer;
+
+  for (const pageEntry of state.pageEntries) {
+    currentPageObserver.observe(pageEntry.pageShell);
   }
 }
 
@@ -669,9 +710,11 @@ function observePageRendering(session) {
         state.totalPages,
         nextScrollTop < lastScrollTop ? -1 : 1
       );
+      retainedRenderPageNumbers = pageNumbers;
       lastScrollTop = nextScrollTop;
       if (!pageNumbers.length) {
         session.prioritizePages([]);
+        session.releasePagesExcept([]);
         return;
       }
 
@@ -693,6 +736,7 @@ function observePageRendering(session) {
     pageEntry.pageShell.dataset.pageNumber = String(pageEntry.pageNumber);
     pageRenderObserver.observe(pageEntry.pageShell);
   }
+  observeCurrentPage(session);
 }
 
 function cancelCurrentLayout() {
@@ -708,6 +752,9 @@ function cancelCurrentLayout() {
   }
   pageRenderObserver?.disconnect();
   pageRenderObserver = null;
+  currentPageObserver?.disconnect();
+  currentPageObserver = null;
+  retainedRenderPageNumbers = [];
   pdfRenderSession?.cancelRendering();
 }
 
@@ -912,6 +959,7 @@ async function rerenderPages() {
     [state.currentPage],
     state.totalPages
   );
+  retainedRenderPageNumbers = initialPages;
   const completed = await renderPageNumbers(initialPages, session, metrics);
   if (requestId !== zoomRenderRequestId || session !== pdfRenderSession) {
     metrics.finish('discarded');
@@ -1073,11 +1121,26 @@ function scheduleResponsiveRerender() {
     return;
   }
 
-  cancelCurrentLayout();
+  if (resizeRerenderTimer) {
+    window.clearTimeout(resizeRerenderTimer);
+  }
   resizeRerenderTimer = window.setTimeout(() => {
     resizeRerenderTimer = null;
 
+    const session = pdfRenderSession;
+    if (session) {
+      const nextScale = session.resolveScale(getZoomConfig(), {
+        width: workspaceEl.clientWidth,
+        height: workspaceEl.clientHeight,
+      });
+      if (Math.abs(nextScale - state.renderedZoom) < 0.0001) {
+        observeCurrentPage(session);
+        return;
+      }
+    }
+
     state.zoomContext = createZoomContext();
+    cancelCurrentLayout();
     void rerenderPages();
   }, 120);
 }
@@ -1473,9 +1536,6 @@ window.addEventListener('keydown', (event) => {
   }
 });
 
-workspaceEl.addEventListener('scroll', updateCurrentPageFromScroll, {
-  passive: true,
-});
 workspaceEl.addEventListener('wheel', applyWheelZoom, { passive: false });
 window.addEventListener('resize', scheduleResponsiveRerender, {
   passive: true,

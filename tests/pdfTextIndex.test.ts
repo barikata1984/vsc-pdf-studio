@@ -105,6 +105,8 @@ test('search finds an unrendered page and renders it only when revealed', async 
     pageNumber,
     width: 600,
     height: 800,
+    renderState: 'idle',
+    textReady: false,
     searchLayer: new FakeLayer(),
     textLayer: {
       getBoundingClientRect: () => ({
@@ -125,7 +127,6 @@ test('search finds an unrendered page and renders it only when revealed', async 
     ],
     searchMatches: [],
     activeSearchMatchIndex: -1,
-    pageJumpInProgress: false,
     currentPage: 1,
   };
   const classList = { toggle() {} };
@@ -163,10 +164,11 @@ test('search finds an unrendered page and renders it only when revealed', async 
       findTextNode: (node: unknown) => node ?? null,
       getPageScrollTop: (pageEntry: { pageNumber: number }) =>
         pageEntry.pageNumber * 1000,
-      updateCurrentPageFromScroll() {},
       updatePageIndicator() {},
       async ensurePageRendered(pageNumber: number) {
         requestedPages.push(pageNumber);
+        pageEntries[pageNumber - 1].renderState = 'rendered';
+        pageEntries[pageNumber - 1].textReady = true;
         pageEntries[pageNumber - 1].textDivs = [{}];
         controller.updateSearchResults({ preserveActive: true });
         return true;
@@ -185,6 +187,13 @@ test('search finds an unrendered page and renders it only when revealed', async 
     assert.equal(state.searchMatches[0].rects.length, 1);
     assert.deepEqual(scrolledTo, { top: 2028, left: 16, behavior: 'auto' });
     assert.equal(searchCount.textContent, '1 / 1');
+
+    state.searchMatches[0].rects = [{ stale: true }];
+    pageEntries[1].renderState = 'idle';
+    pageEntries[1].textReady = false;
+    requestedPages.length = 0;
+    await controller.revealSearchMatch(0);
+    assert.deepEqual(requestedPages, [2]);
   } finally {
     (globalThis as any).document = originalDocument;
     (globalThis as any).window = originalWindow;
@@ -340,6 +349,42 @@ test('webview configures the bundled PDF worker without loading it as a script',
   assert.doesNotMatch(providerSource, /<script[^>]+pdf\.worker\.min\.js/);
 });
 
+test('main tracks the current page with intersections and skips unchanged responsive layouts', () => {
+  const mainSource = fs.readFileSync(
+    path.resolve(__dirname, '../../media/main.js'),
+    'utf8'
+  );
+
+  assert.match(
+    mainSource,
+    /rootMargin: getCurrentPageRootMargin\(workspaceEl\.clientHeight\)/
+  );
+  assert.doesNotMatch(
+    mainSource,
+    /workspaceEl\.addEventListener\('scroll', updateCurrentPageFromScroll/
+  );
+  assert.match(mainSource, /session\.resolveScale\([\s\S]+state\.renderedZoom/);
+  assert.match(
+    mainSource,
+    /Math\.abs\(nextScale - state\.renderedZoom\)[\s\S]+observeCurrentPage\(session\)/
+  );
+  assert.match(
+    mainSource,
+    /\.\.\.targetPageNumbers, \.\.\.retainedRenderPageNumbers/
+  );
+});
+
+test('current page observer uses a vertical pixel band and normalizes spreads', async () => {
+  const { getCurrentPageNumber, getCurrentPageRootMargin } =
+    await importMedia('viewport.js');
+
+  assert.equal(getCurrentPageRootMargin(800), '-360px 0px -360px 0px');
+  assert.equal(getCurrentPageNumber([], 'single'), null);
+  assert.equal(getCurrentPageNumber([2], 'single'), 2);
+  assert.equal(getCurrentPageNumber([2], 'double'), 1);
+  assert.equal(getCurrentPageNumber([4, 3], 'double'), 3);
+});
+
 test('render session creates page shells and draws only requested pages', async () => {
   const { createPdfRenderSession } = await importMedia('pdfRenderer.js');
   const originalDocument = (globalThis as any).document;
@@ -359,6 +404,7 @@ test('render session creates page shells and draws only requested pages', async 
   let activeTextLayerRender: { reject: (error: Error) => void } | null = null;
   let lastRenderedWidth = 0;
   const renderStartWidths: number[] = [];
+  const cleanupCalls = [0, 0, 0];
 
   class FakeElement {
     children: FakeElement[] = [];
@@ -374,11 +420,23 @@ test('render session creates page shells and draws only requested pages', async 
       add: (...names: string[]) => {
         this.className = [this.className, ...names].filter(Boolean).join(' ');
       },
+      remove: (...names: string[]) => {
+        this.className = this.className
+          .split(' ')
+          .filter((name) => name && !names.includes(name))
+          .join(' ');
+      },
     };
 
     append(...children: FakeElement[]) {
       this.children.push(...children);
     }
+
+    replaceChildren(...children: FakeElement[]) {
+      this.children = children;
+    }
+
+    replaceWith() {}
 
     getContext() {
       return {};
@@ -424,7 +482,7 @@ test('render session creates page shells and draws only requested pages', async 
     [842, 595],
     [400, 400],
   ];
-  const pages = sizes.map(([width, height]) => ({
+  const pages = sizes.map(([width, height], pageIndex) => ({
     getViewport({ scale }: { scale: number }) {
       return { width: width * scale, height: height * scale, scale };
     },
@@ -479,6 +537,10 @@ test('render session creates page shells and draws only requested pages', async 
         });
       });
     },
+    cleanup() {
+      cleanupCalls[pageIndex] += 1;
+      return true;
+    },
   }));
   const pdf = {
     numPages: pages.length,
@@ -517,6 +579,13 @@ test('render session creates page shells and draws only requested pages', async 
     assert.equal(layout.pages[0].drawingCanvas.style.width, '612px');
     assert.equal(renderCalls, 0);
     assert.equal(textLayerRenderCalls, 0);
+    assert.equal(
+      session.resolveScale(
+        { mode: 'actual-size', scale: 4, layout: 'single' },
+        { width: 300, height: 200 }
+      ),
+      layout.resolvedScale
+    );
 
     const textIndex = await session.prepareTextIndex(layout.pages);
     assert.equal(renderCalls, 0);
@@ -525,6 +594,7 @@ test('render session creates page shells and draws only requested pages', async 
     assert.equal(textIndex[0].text, 'page-612');
     assert.equal(await session.prepareTextIndex(layout.pages), textIndex);
     assert.equal(textCalls, 3);
+    assert.deepEqual(cleanupCalls, [1, 1, 1]);
 
     assert.equal(await session.renderPage(layout.pages[1]), true);
     assert.equal(renderCalls, 1);
@@ -535,6 +605,35 @@ test('render session creates page shells and draws only requested pages', async 
 
     assert.equal(await session.renderPage(layout.pages[1]), true);
     assert.equal(renderCalls, 1);
+
+    layout.pages[1].drawingCanvas.width = 842;
+    layout.pages[1].drawingCanvas.height = 595;
+    const formOverlay = new FakeElement();
+    const highlightOverlay = new FakeElement();
+    layout.pages[1].textLayer.style.pointerEvents = 'auto';
+    layout.pages[1].textLayer.style.userSelect = 'text';
+    layout.pages[1].formLayer.append(formOverlay);
+    layout.pages[1].highlightLayer.append(highlightOverlay);
+    const releasedTextLayer = layout.pages[1].textLayer;
+    const cleanupCallsBeforeRelease = cleanupCalls[1];
+    session.releasePagesExcept([1]);
+    assert.equal(layout.pages[1].pdfCanvas.width, 1);
+    assert.equal(layout.pages[1].drawingCanvas.width, 1);
+    assert.equal(layout.pages[1].renderState, 'idle');
+    assert.equal(layout.pages[1].textReady, false);
+    assert.notEqual(layout.pages[1].textLayer, releasedTextLayer);
+    assert.equal(layout.pages[1].textLayer.style.pointerEvents, 'auto');
+    assert.equal(layout.pages[1].textLayer.style.userSelect, 'text');
+    assert.deepEqual(layout.pages[1].formLayer.children, [formOverlay]);
+    assert.deepEqual(layout.pages[1].highlightLayer.children, [
+      highlightOverlay,
+    ]);
+    assert.equal(cleanupCalls[1], cleanupCallsBeforeRelease + 1);
+
+    assert.equal(await session.renderPage(layout.pages[1]), true);
+    assert.equal(renderCalls, 2);
+    assert.deepEqual(layout.pages[1].textContentItemsStr, ['page-842']);
+    assert.equal(textCalls, 3);
 
     holdNextRender = true;
     const obsoleteRender = session.renderPage(layout.pages[0]);
@@ -590,6 +689,7 @@ test('render session creates page shells and draws only requested pages', async 
     );
     await Promise.resolve();
     const currentRequest = session.prioritizePages([3]);
+    session.releasePagesExcept([3]);
     const currentRender = session.renderPage(
       supersededLayout.pages[2],
       undefined,
@@ -600,6 +700,8 @@ test('render session creates page shells and draws only requested pages', async 
     pendingRenders[0].resolve();
     assert.deepEqual(await Promise.all(oldRenders), [false, false, true]);
     assert.equal(await currentRender, true);
+    assert.equal(supersededLayout.pages[0].pdfCanvas.width, 1);
+    assert.equal(supersededLayout.pages[1].pdfCanvas.width, 1);
 
     holdNextRender = false;
     const renderCallsBeforeThumbnail = renderCalls;

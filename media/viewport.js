@@ -1,3 +1,21 @@
+export function getCurrentPageRootMargin(viewportHeight) {
+  const margin = Math.max(0, Math.floor(viewportHeight * 0.45));
+  return `-${margin}px 0px -${margin}px 0px`;
+}
+
+export function getCurrentPageNumber(pageNumbers, pageLayout) {
+  if (!pageNumbers.length) {
+    return null;
+  }
+  return Math.min(
+    ...pageNumbers.map((pageNumber) =>
+      pageLayout === 'double' && pageNumber % 2 === 0
+        ? pageNumber - 1
+        : pageNumber
+    )
+  );
+}
+
 export function createViewportController({
   state,
   workspaceEl,
@@ -38,38 +56,19 @@ export function createViewportController({
     return pageEntry.pageShell.offsetTop;
   }
 
-  function updateCurrentPageFromScroll() {
-    if (!state.pageEntries.length || state.pageJumpInProgress) {
+  function setCurrentPage(pageNumber) {
+    if (!Number.isInteger(pageNumber) || pageNumber === state.currentPage) {
       return;
     }
 
-    const viewportTop = workspaceEl.scrollTop;
-    let closestPage = state.pageEntries[0].pageNumber;
-    let closestDistance = Number.POSITIVE_INFINITY;
-    let closestLeft = Number.POSITIVE_INFINITY;
-
-    for (const pageEntry of state.pageEntries) {
-      const distance = Math.abs(getPageScrollTop(pageEntry) - viewportTop);
-      const left = pageEntry.pageShell.offsetLeft;
-
-      if (
-        distance < closestDistance ||
-        (Math.abs(distance - closestDistance) <= 1 && left < closestLeft)
-      ) {
-        closestDistance = distance;
-        closestLeft = left;
-        closestPage = pageEntry.pageNumber;
-      }
-    }
-
-    state.currentPage = closestPage;
+    state.currentPage = pageNumber;
     if (state.activeOutlineKey) {
       const activeOutlineItem = outlineListEl.querySelector(
         `.sidebar-item[data-outline-key="${CSS.escape(state.activeOutlineKey)}"]`
       );
       if (
         !activeOutlineItem ||
-        activeOutlineItem.dataset.page !== String(closestPage)
+        activeOutlineItem.dataset.page !== String(pageNumber)
       ) {
         state.activeOutlineKey = null;
       }
@@ -179,7 +178,6 @@ export function createViewportController({
       return;
     }
 
-    state.pageJumpInProgress = true;
     state.currentPage = pageNumber;
     state.activeOutlineKey = outlineKey;
     const expandedOutline = expandOutlinePathForPage(state.outline, pageNumber);
@@ -205,17 +203,12 @@ export function createViewportController({
         inline: 'nearest',
       });
     }
-
-    window.setTimeout(() => {
-      state.pageJumpInProgress = false;
-      updateCurrentPageFromScroll();
-    }, 150);
   }
 
   return {
     updatePageIndicator,
     updateZoomPresetIndicator,
-    updateCurrentPageFromScroll,
+    setCurrentPage,
     setActiveColor,
     getCommentOverlayPlacement,
     jumpToPage,

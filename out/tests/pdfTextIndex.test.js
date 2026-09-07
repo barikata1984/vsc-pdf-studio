@@ -117,6 +117,8 @@ async function loadPageTextContents(data) {
         pageNumber,
         width: 600,
         height: 800,
+        renderState: 'idle',
+        textReady: false,
         searchLayer: new FakeLayer(),
         textLayer: {
             getBoundingClientRect: () => ({
@@ -137,7 +139,6 @@ async function loadPageTextContents(data) {
         ],
         searchMatches: [],
         activeSearchMatchIndex: -1,
-        pageJumpInProgress: false,
         currentPage: 1,
     };
     const classList = { toggle() { } };
@@ -172,10 +173,11 @@ async function loadPageTextContents(data) {
             searchNextEl: { disabled: false },
             findTextNode: (node) => node ?? null,
             getPageScrollTop: (pageEntry) => pageEntry.pageNumber * 1000,
-            updateCurrentPageFromScroll() { },
             updatePageIndicator() { },
             async ensurePageRendered(pageNumber) {
                 requestedPages.push(pageNumber);
+                pageEntries[pageNumber - 1].renderState = 'rendered';
+                pageEntries[pageNumber - 1].textReady = true;
                 pageEntries[pageNumber - 1].textDivs = [{}];
                 controller.updateSearchResults({ preserveActive: true });
                 return true;
@@ -191,6 +193,12 @@ async function loadPageTextContents(data) {
         strict_1.default.equal(state.searchMatches[0].rects.length, 1);
         strict_1.default.deepEqual(scrolledTo, { top: 2028, left: 16, behavior: 'auto' });
         strict_1.default.equal(searchCount.textContent, '1 / 1');
+        state.searchMatches[0].rects = [{ stale: true }];
+        pageEntries[1].renderState = 'idle';
+        pageEntries[1].textReady = false;
+        requestedPages.length = 0;
+        await controller.revealSearchMatch(0);
+        strict_1.default.deepEqual(requestedPages, [2]);
     }
     finally {
         globalThis.document = originalDocument;
@@ -322,6 +330,22 @@ async function loadPageTextContents(data) {
     strict_1.default.doesNotMatch(providerSource, /src=.*pdfWorkerUri/);
     strict_1.default.doesNotMatch(providerSource, /<script[^>]+pdf\.worker\.min\.js/);
 });
+(0, node_test_1.default)('main tracks the current page with intersections and skips unchanged responsive layouts', () => {
+    const mainSource = fs.readFileSync(path.resolve(__dirname, '../../media/main.js'), 'utf8');
+    strict_1.default.match(mainSource, /rootMargin: getCurrentPageRootMargin\(workspaceEl\.clientHeight\)/);
+    strict_1.default.doesNotMatch(mainSource, /workspaceEl\.addEventListener\('scroll', updateCurrentPageFromScroll/);
+    strict_1.default.match(mainSource, /session\.resolveScale\([\s\S]+state\.renderedZoom/);
+    strict_1.default.match(mainSource, /Math\.abs\(nextScale - state\.renderedZoom\)[\s\S]+observeCurrentPage\(session\)/);
+    strict_1.default.match(mainSource, /\.\.\.targetPageNumbers, \.\.\.retainedRenderPageNumbers/);
+});
+(0, node_test_1.default)('current page observer uses a vertical pixel band and normalizes spreads', async () => {
+    const { getCurrentPageNumber, getCurrentPageRootMargin } = await importMedia('viewport.js');
+    strict_1.default.equal(getCurrentPageRootMargin(800), '-360px 0px -360px 0px');
+    strict_1.default.equal(getCurrentPageNumber([], 'single'), null);
+    strict_1.default.equal(getCurrentPageNumber([2], 'single'), 2);
+    strict_1.default.equal(getCurrentPageNumber([2], 'double'), 1);
+    strict_1.default.equal(getCurrentPageNumber([4, 3], 'double'), 3);
+});
 (0, node_test_1.default)('render session creates page shells and draws only requested pages', async () => {
     const { createPdfRenderSession } = await importMedia('pdfRenderer.js');
     const originalDocument = globalThis.document;
@@ -341,6 +365,7 @@ async function loadPageTextContents(data) {
     let activeTextLayerRender = null;
     let lastRenderedWidth = 0;
     const renderStartWidths = [];
+    const cleanupCalls = [0, 0, 0];
     class FakeElement {
         children = [];
         className = '';
@@ -355,10 +380,20 @@ async function loadPageTextContents(data) {
             add: (...names) => {
                 this.className = [this.className, ...names].filter(Boolean).join(' ');
             },
+            remove: (...names) => {
+                this.className = this.className
+                    .split(' ')
+                    .filter((name) => name && !names.includes(name))
+                    .join(' ');
+            },
         };
         append(...children) {
             this.children.push(...children);
         }
+        replaceChildren(...children) {
+            this.children = children;
+        }
+        replaceWith() { }
         getContext() {
             return {};
         }
@@ -397,7 +432,7 @@ async function loadPageTextContents(data) {
         [842, 595],
         [400, 400],
     ];
-    const pages = sizes.map(([width, height]) => ({
+    const pages = sizes.map(([width, height], pageIndex) => ({
         getViewport({ scale }) {
             return { width: width * scale, height: height * scale, scale };
         },
@@ -447,6 +482,10 @@ async function loadPageTextContents(data) {
                 });
             });
         },
+        cleanup() {
+            cleanupCalls[pageIndex] += 1;
+            return true;
+        },
     }));
     const pdf = {
         numPages: pages.length,
@@ -479,6 +518,7 @@ async function loadPageTextContents(data) {
         strict_1.default.equal(layout.pages[0].drawingCanvas.style.width, '612px');
         strict_1.default.equal(renderCalls, 0);
         strict_1.default.equal(textLayerRenderCalls, 0);
+        strict_1.default.equal(session.resolveScale({ mode: 'actual-size', scale: 4, layout: 'single' }, { width: 300, height: 200 }), layout.resolvedScale);
         const textIndex = await session.prepareTextIndex(layout.pages);
         strict_1.default.equal(renderCalls, 0);
         strict_1.default.equal(textCalls, 3);
@@ -486,6 +526,7 @@ async function loadPageTextContents(data) {
         strict_1.default.equal(textIndex[0].text, 'page-612');
         strict_1.default.equal(await session.prepareTextIndex(layout.pages), textIndex);
         strict_1.default.equal(textCalls, 3);
+        strict_1.default.deepEqual(cleanupCalls, [1, 1, 1]);
         strict_1.default.equal(await session.renderPage(layout.pages[1]), true);
         strict_1.default.equal(renderCalls, 1);
         strict_1.default.equal(layout.pages[1].renderState, 'rendered');
@@ -494,6 +535,33 @@ async function loadPageTextContents(data) {
         strict_1.default.equal(textLayerRenderCalls, 1);
         strict_1.default.equal(await session.renderPage(layout.pages[1]), true);
         strict_1.default.equal(renderCalls, 1);
+        layout.pages[1].drawingCanvas.width = 842;
+        layout.pages[1].drawingCanvas.height = 595;
+        const formOverlay = new FakeElement();
+        const highlightOverlay = new FakeElement();
+        layout.pages[1].textLayer.style.pointerEvents = 'auto';
+        layout.pages[1].textLayer.style.userSelect = 'text';
+        layout.pages[1].formLayer.append(formOverlay);
+        layout.pages[1].highlightLayer.append(highlightOverlay);
+        const releasedTextLayer = layout.pages[1].textLayer;
+        const cleanupCallsBeforeRelease = cleanupCalls[1];
+        session.releasePagesExcept([1]);
+        strict_1.default.equal(layout.pages[1].pdfCanvas.width, 1);
+        strict_1.default.equal(layout.pages[1].drawingCanvas.width, 1);
+        strict_1.default.equal(layout.pages[1].renderState, 'idle');
+        strict_1.default.equal(layout.pages[1].textReady, false);
+        strict_1.default.notEqual(layout.pages[1].textLayer, releasedTextLayer);
+        strict_1.default.equal(layout.pages[1].textLayer.style.pointerEvents, 'auto');
+        strict_1.default.equal(layout.pages[1].textLayer.style.userSelect, 'text');
+        strict_1.default.deepEqual(layout.pages[1].formLayer.children, [formOverlay]);
+        strict_1.default.deepEqual(layout.pages[1].highlightLayer.children, [
+            highlightOverlay,
+        ]);
+        strict_1.default.equal(cleanupCalls[1], cleanupCallsBeforeRelease + 1);
+        strict_1.default.equal(await session.renderPage(layout.pages[1]), true);
+        strict_1.default.equal(renderCalls, 2);
+        strict_1.default.deepEqual(layout.pages[1].textContentItemsStr, ['page-842']);
+        strict_1.default.equal(textCalls, 3);
         holdNextRender = true;
         const obsoleteRender = session.renderPage(layout.pages[0]);
         session.cancelRendering();
@@ -532,12 +600,15 @@ async function loadPageTextContents(data) {
         const oldRenders = supersededLayout.pages.map((pageEntry) => session.renderPage(pageEntry, undefined, oldRequest));
         await Promise.resolve();
         const currentRequest = session.prioritizePages([3]);
+        session.releasePagesExcept([3]);
         const currentRender = session.renderPage(supersededLayout.pages[2], undefined, currentRequest);
         await new Promise((resolve) => setImmediate(resolve));
         strict_1.default.equal(activeRenderCalls, 1);
         pendingRenders[0].resolve();
         strict_1.default.deepEqual(await Promise.all(oldRenders), [false, false, true]);
         strict_1.default.equal(await currentRender, true);
+        strict_1.default.equal(supersededLayout.pages[0].pdfCanvas.width, 1);
+        strict_1.default.equal(supersededLayout.pages[1].pdfCanvas.width, 1);
         holdNextRender = false;
         const renderCallsBeforeThumbnail = renderCalls;
         const thumbnail = await session.renderThumbnail(2, 92);

@@ -11,7 +11,6 @@ export function createSearchController({
   searchNextEl,
   findTextNode,
   getPageScrollTop,
-  updateCurrentPageFromScroll,
   updatePageIndicator,
   ensurePageRendered,
 }) {
@@ -169,7 +168,11 @@ export function createSearchController({
     if (!pageEntry) {
       return;
     }
-    if (!match.rects.length) {
+    if (
+      !match.rects.length ||
+      pageEntry.renderState !== 'rendered' ||
+      !pageEntry.textReady
+    ) {
       const requestedMatch = match;
       const rendered = await ensurePageRendered(match.pageNumber);
       match = state.searchMatches[index];
@@ -190,7 +193,6 @@ export function createSearchController({
       }
     }
 
-    state.pageJumpInProgress = true;
     state.currentPage = match.pageNumber;
     updatePageIndicator();
     const rect = match.rects[0] ?? { x: 0, y: 0 };
@@ -199,10 +201,6 @@ export function createSearchController({
       left: Math.max(0, rect.x - 24),
       behavior: 'auto',
     });
-    window.setTimeout(() => {
-      state.pageJumpInProgress = false;
-      updateCurrentPageFromScroll();
-    }, 120);
   }
 
   function moveSearchMatch(direction) {

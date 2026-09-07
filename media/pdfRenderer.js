@@ -90,6 +90,8 @@ export async function createPdfRenderSession(
   const activeRenderTasks = new Map();
   const activeTextLayers = new Map();
   const activeThumbnailTasks = new Set();
+  const renderingPageEntries = new Set();
+  const renderedPageEntries = new Set();
   const thumbnailDataUrls = new Map();
   const thumbnailPromises = new Map();
   const textContents = new Map();
@@ -163,13 +165,78 @@ export async function createPdfRenderSession(
     );
   }
 
+  function createTextLayer(pdfWidth, pdfHeight) {
+    const textLayerBuilder = new globalThis.pdfjsViewer.TextLayerBuilder({});
+    const textLayer = textLayerBuilder.div;
+    textLayer.classList.add('text-layer');
+    textLayer.style.width = `${pdfWidth}px`;
+    textLayer.style.height = `${pdfHeight}px`;
+    return { textLayerBuilder, textLayer };
+  }
+
+  function cleanupPageWhenUnused(pageEntry) {
+    if (
+      requestedPageNumbers.has(pageEntry.pageNumber) ||
+      [...renderingPageEntries, ...renderedPageEntries].some(
+        (entry) => entry.pageNumber === pageEntry.pageNumber
+      )
+    ) {
+      return;
+    }
+    pageEntry.page.cleanup();
+  }
+
+  function releasePageResources(pageEntry) {
+    renderedPageEntries.delete(pageEntry);
+    pageEntry.releaseWhenIdle = false;
+    pageEntry.renderState = 'idle';
+    pageEntry.renderPromise = null;
+    pageEntry.renderTask = null;
+    pageEntry.pdfCanvas.width = 1;
+    pageEntry.pdfCanvas.height = 1;
+    pageEntry.drawingCanvas.width = 1;
+    pageEntry.drawingCanvas.height = 1;
+    pageEntry.pageShell.classList.remove('is-rendered');
+    pageEntry.textLayerBuilder.cancel();
+    const { pointerEvents, userSelect } = pageEntry.textLayer.style;
+    const { textLayerBuilder, textLayer } = createTextLayer(
+      pageEntry.pdfWidth,
+      pageEntry.pdfHeight
+    );
+    textLayer.style.pointerEvents = pointerEvents;
+    textLayer.style.userSelect = userSelect;
+    pageEntry.textLayer.replaceWith(textLayer);
+    pageEntry.textLayerBuilder = textLayerBuilder;
+    pageEntry.textLayer = textLayer;
+    pageEntry.textDivs = [];
+    pageEntry.textContentItemsStr = [];
+    pageEntry.textReady = false;
+    pageEntry.textPromise = null;
+    pageEntry.searchLayer.replaceChildren();
+    pageEntry.page.cleanup();
+  }
+
+  function releasePagesExcept(pageNumbers) {
+    const retainedPageNumbers = new Set(pageNumbers);
+    for (const pageEntry of renderingPageEntries) {
+      if (!retainedPageNumbers.has(pageEntry.pageNumber)) {
+        pageEntry.releaseWhenIdle = true;
+      }
+    }
+    for (const pageEntry of [...renderedPageEntries]) {
+      if (!retainedPageNumbers.has(pageEntry.pageNumber)) {
+        releasePageResources(pageEntry);
+      }
+    }
+  }
+
   function createLayout(zoomConfig, workspaceSize) {
-    const TextLayerBuilder = globalThis.pdfjsViewer?.TextLayerBuilder;
-    if (!TextLayerBuilder) {
+    if (!globalThis.pdfjsViewer?.TextLayerBuilder) {
       throw new Error('pdf.js viewer failed to load in the webview.');
     }
 
     cancelRendering();
+    releasePagesExcept([]);
     const layoutGeneration = generation;
     const basePageSize = pageSizes[0];
     const resolvedScale = resolveScale(zoomConfig, workspaceSize, basePageSize);
@@ -194,8 +261,10 @@ export async function createPdfRenderSession(
       const searchLayer = document.createElement('div');
       const formLayer = document.createElement('div');
       const commentLayer = document.createElement('div');
-      const textLayerBuilder = new TextLayerBuilder({});
-      const textLayer = textLayerBuilder.div;
+      const { textLayerBuilder, textLayer } = createTextLayer(
+        unscaledViewport.width,
+        unscaledViewport.height
+      );
       const drawingCanvas = document.createElement('canvas');
 
       pageShell.className = 'page-shell';
@@ -204,7 +273,6 @@ export async function createPdfRenderSession(
       searchLayer.className = 'search-layer';
       formLayer.className = 'form-layer';
       commentLayer.className = 'comment-layer';
-      textLayer.classList.add('text-layer');
       drawingCanvas.className = 'drawing-canvas';
 
       pageShell.style.setProperty('--scale-factor', String(viewport.scale));
@@ -218,8 +286,6 @@ export async function createPdfRenderSession(
       pdfCanvas.style.height = `${viewport.height}px`;
       drawingCanvas.style.width = `${viewport.width}px`;
       drawingCanvas.style.height = `${viewport.height}px`;
-      textLayer.style.width = `${unscaledViewport.width}px`;
-      textLayer.style.height = `${unscaledViewport.height}px`;
 
       pageShell.append(
         pdfCanvas,
@@ -257,6 +323,7 @@ export async function createPdfRenderSession(
         renderPromise: null,
         renderTask: null,
         renderRequestId: null,
+        releaseWhenIdle: false,
       });
     }
 
@@ -289,6 +356,7 @@ export async function createPdfRenderSession(
       return textContent;
     } finally {
       textContentPromises.delete(pageNumber);
+      cleanupPageWhenUnused(pageEntry);
     }
   }
 
@@ -352,15 +420,30 @@ export async function createPdfRenderSession(
       return false;
     }
     pageEntry.renderRequestId = pageRenderRequestId;
+    pageEntry.releaseWhenIdle = false;
     if (pageEntry.renderState === 'rendered') {
       return true;
     }
     if (pageEntry.renderPromise) {
-      return pageEntry.renderPromise;
+      const pendingRender = pageEntry.renderPromise;
+      const completed = await pendingRender;
+      if (
+        completed ||
+        pageEntry.generation !== generation ||
+        pageEntry.renderRequestId !== pageRenderRequestId
+      ) {
+        return completed;
+      }
+      if (pageEntry.renderPromise === pendingRender) {
+        pageEntry.renderPromise = null;
+        pageEntry.renderState = 'idle';
+      }
+      return renderPage(pageEntry, pageMetrics, pageRenderRequestId);
     }
 
     const entryGeneration = pageEntry.generation;
     pageEntry.renderState = 'rendering';
+    renderingPageEntries.add(pageEntry);
     const renderPromise = (async () => {
       const rendered = await withRenderSlot(async () => {
         if (!isPageRenderCurrent(pageEntry, entryGeneration)) {
@@ -422,6 +505,7 @@ export async function createPdfRenderSession(
       }
       pageEntry.renderState = 'rendered';
       pageEntry.pageShell.classList.add('is-rendered');
+      renderedPageEntries.add(pageEntry);
       return true;
     })();
     pageEntry.renderPromise = renderPromise;
@@ -434,6 +518,10 @@ export async function createPdfRenderSession(
       ) {
         pageEntry.renderState = 'idle';
         pageEntry.renderPromise = null;
+      }
+      renderingPageEntries.delete(pageEntry);
+      if (pageEntry.releaseWhenIdle) {
+        releasePageResources(pageEntry);
       }
     }
   }
@@ -508,6 +596,7 @@ export async function createPdfRenderSession(
         throw error;
       } finally {
         activeThumbnailTasks.delete(renderTask);
+        cleanupPageWhenUnused({ pageNumber, page });
       }
       const dataUrl = pageMetrics.measure(
         'page.thumbnail',
@@ -531,14 +620,18 @@ export async function createPdfRenderSession(
     pages,
     outline,
     createLayout,
+    resolveScale: (zoomConfig, workspaceSize) =>
+      resolveScale(zoomConfig, workspaceSize, pageSizes[0]),
     renderPage,
     prioritizePages,
+    releasePagesExcept,
     renderThumbnail,
     prepareTextIndex,
     cancelRendering,
     async destroy() {
       destroyed = true;
       cancelRendering();
+      releasePagesExcept([]);
       for (const task of activeThumbnailTasks) {
         task.cancel();
       }
