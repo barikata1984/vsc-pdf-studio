@@ -57,7 +57,8 @@ async function importMedia(fileName) {
 }
 async function importPdfjs() {
     const moduleId = 'pdfjs-dist/legacy/build/pdf.js';
-    return import(moduleId);
+    const module = await import(moduleId);
+    return module.default ?? module;
 }
 async function createSamplePdf() {
     const pdfDoc = await pdf_lib_1.PDFDocument.create();
@@ -102,5 +103,12 @@ async function loadPageTextContents(data) {
         const [width, height] = PAGE_SIZES[pageIndex];
         strict_1.default.ok(Math.abs(ratio - width / height) < 1e-6, `page ${pageIndex + 1} ratio ${ratio} != ${width / height}`);
     });
+});
+(0, node_test_1.default)('buffered page selection clamps boundaries and removes duplicates', async () => {
+    const { getBufferedPageNumbers } = await importMedia('pdfRenderer.js');
+    strict_1.default.deepEqual(getBufferedPageNumbers([], 5), []);
+    strict_1.default.deepEqual(getBufferedPageNumbers([1], 5), [1, 2]);
+    strict_1.default.deepEqual(getBufferedPageNumbers([5], 5), [4, 5]);
+    strict_1.default.deepEqual(getBufferedPageNumbers([2, 3], 5), [1, 2, 3, 4]);
 });
 //# sourceMappingURL=pdfTextIndex.test.js.map

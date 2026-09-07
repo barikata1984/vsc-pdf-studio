@@ -1,5 +1,25 @@
 import { startRenderRequest } from './renderMetrics.js';
 
+export function getBufferedPageNumbers(
+  visiblePageNumbers,
+  pageCount,
+  bufferPages = 1
+) {
+  const pages = new Set();
+  for (const pageNumber of visiblePageNumbers) {
+    for (
+      let candidate = pageNumber - bufferPages;
+      candidate <= pageNumber + bufferPages;
+      candidate += 1
+    ) {
+      if (candidate >= 1 && candidate <= pageCount) {
+        pages.add(candidate);
+      }
+    }
+  }
+  return [...pages].sort((left, right) => left - right);
+}
+
 export async function renderPdf(
   base64,
   container,

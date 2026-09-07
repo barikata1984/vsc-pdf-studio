@@ -24,7 +24,8 @@ async function importMedia(fileName: string): Promise<any> {
 
 async function importPdfjs(): Promise<any> {
   const moduleId = 'pdfjs-dist/legacy/build/pdf.js';
-  return import(moduleId);
+  const module = await import(moduleId);
+  return module.default ?? module;
 }
 
 async function createSamplePdf(): Promise<Uint8Array> {
@@ -92,4 +93,13 @@ test('page viewport aspect ratios match the generated page sizes', async () => {
       `page ${pageIndex + 1} ratio ${ratio} != ${width / height}`
     );
   });
+});
+
+test('buffered page selection clamps boundaries and removes duplicates', async () => {
+  const { getBufferedPageNumbers } = await importMedia('pdfRenderer.js');
+
+  assert.deepEqual(getBufferedPageNumbers([], 5), []);
+  assert.deepEqual(getBufferedPageNumbers([1], 5), [1, 2]);
+  assert.deepEqual(getBufferedPageNumbers([5], 5), [4, 5]);
+  assert.deepEqual(getBufferedPageNumbers([2, 3], 5), [1, 2, 3, 4]);
 });

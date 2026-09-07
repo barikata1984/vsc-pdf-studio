@@ -31,21 +31,21 @@
 
 - Produces: `getBufferedPageNumbers(visiblePageNumbers, pageCount, bufferPages = 1): number[]`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add assertions that empty input returns an empty list, page 1 expands to pages 1 and 2, the last page does not exceed `pageCount`, and multiple visible pages produce a sorted list without duplicates.
 
-- [ ] **Step 2: Run the focused test and verify failure**
+- [x] **Step 2: Run the focused test and verify failure**
 
 Run: `npm test -- --test-name-pattern="buffered page"`
 
 Expected: FAIL because `getBufferedPageNumbers` is not exported.
 
-- [ ] **Step 3: Implement the page selection helper**
+- [x] **Step 3: Implement the page selection helper**
 
 Use a `Set`, clamp every candidate to `1..pageCount`, and return the values in ascending order. Do not add a scheduler abstraction.
 
-- [ ] **Step 4: Run the focused test**
+- [x] **Step 4: Run the focused test**
 
 Run: `npm test -- --test-name-pattern="buffered page"`
 
