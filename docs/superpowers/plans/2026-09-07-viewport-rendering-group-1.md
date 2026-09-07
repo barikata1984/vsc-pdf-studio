@@ -64,23 +64,23 @@ Expected: PASS.
 - Session methods: `createLayout(zoomConfig, workspaceSize)`, `renderPage(pageEntry, metrics)`, `ensureTextLayers(pageEntries, metrics)`, `cancelRendering()`, `destroy()`
 - `createLayout` returns the existing `pages`, `outline`, `resolvedScale`, and `fragment` fields.
 
-- [ ] **Step 1: Move PDF loading and page metadata into a session**
+- [x] **Step 1: Move PDF loading and page metadata into a session**
 
 Decode and call `getDocument` only in `createPdfRenderSession`. Cache the document proxy, optional outline document proxy, outline, page proxies, and scale-1 dimensions.
 
-- [ ] **Step 2: Split layout creation from page rendering**
+- [x] **Step 2: Split layout creation from page rendering**
 
 `createLayout` creates every page shell and overlay layer with correct dimensions but leaves the PDF canvas empty. Preserve every `pageEntry` field used by existing controllers.
 
-- [ ] **Step 3: Render one page on demand**
+- [x] **Step 3: Render one page on demand**
 
 `renderPage` sizes and draws the PDF canvas, then obtains and renders the text layer. Store the PDF.js render task on the page entry and make repeated calls share the same promise.
 
-- [ ] **Step 4: Add cancellation and disposal**
+- [x] **Step 4: Add cancellation and disposal**
 
 `cancelRendering` cancels active page tasks and invalidates their generation. `destroy` cancels work and destroys both parsed document proxies without destroying the same proxy twice.
 
-- [ ] **Step 5: Replace repeated PDF loading in main**
+- [x] **Step 5: Replace repeated PDF loading in main**
 
 Create the session on the `init` message, reuse it in every `rerenderPages` call, and destroy a previous session before loading a replacement document.
 
@@ -96,19 +96,19 @@ Create the session on the `init` message, reuse it in every `rerenderPages` call
 - Consumes: `getBufferedPageNumbers`, session `renderPage`, and session `cancelRendering`
 - Produces: one `IntersectionObserver` owned by the current layout
 
-- [ ] **Step 1: Observe page shells**
+- [x] **Step 1: Observe page shells**
 
 After replacing the page DOM and attaching existing controllers, observe every shell with `workspaceEl` as the root. Request intersecting pages and their one-page buffer.
 
-- [ ] **Step 2: Prioritize the current page on each layout**
+- [x] **Step 2: Prioritize the current page on each layout**
 
 Before returning from `rerenderPages`, await the current page and its neighbors. The initial layout therefore paints page 1 without waiting for every page.
 
-- [ ] **Step 3: Cancel the prior layout**
+- [x] **Step 3: Cancel the prior layout**
 
 Disconnect the old observer and call `cancelRendering` as soon as zoom, responsive resize, layout, or a replacement document requests another layout.
 
-- [ ] **Step 4: Keep empty shells visually stable**
+- [x] **Step 4: Keep empty shells visually stable**
 
 Use the page shell background while its PDF canvas is empty, and mark a shell rendered only after the current generation completes.
 
@@ -126,19 +126,19 @@ Use the page shell background while its PDF canvas is empty, and mark a shell re
 - Consumes: session `ensureTextLayers`
 - Produces: a main-level asynchronous search refresh that ignores stale queries
 
-- [ ] **Step 1: Reapply page overlays after layout creation**
+- [x] **Step 1: Reapply page overlays after layout creation**
 
 Keep drawing, highlights, comments, forms, sidebar, current-page state, interaction mode, and zoom anchor restoration in their existing order after the page shells enter the DOM.
 
-- [ ] **Step 2: Preserve search across unrendered pages**
+- [x] **Step 2: Preserve search across unrendered pages**
 
 When a non-empty search is requested, await text-layer preparation for all pages without blocking initial display. Ignore a completed preparation if the query or layout generation changed, then call the existing search result calculation.
 
-- [ ] **Step 3: Render navigation targets**
+- [x] **Step 3: Render navigation targets**
 
 Page number, outline, and search navigation continue to use page shells. Their intersection with the viewport triggers the target page render without requiring special navigation state.
 
-- [ ] **Step 4: Keep input behavior on lazily rendered pages**
+- [x] **Step 4: Keep input behavior on lazily rendered pages**
 
 Verify that drawing handlers are registered once per current shell and that highlight, comment, and form overlays use the shell dimensions even before the PDF canvas completes.
 
@@ -148,7 +148,7 @@ Verify that drawing handlers are registered once per current shell and that high
 
 - Modify: `openspec/changes/improve-render-performance/tasks.md`
 
-- [ ] **Step 1: Run all automated checks**
+- [x] **Step 1: Run all automated checks**
 
 Run: `npm test`
 
@@ -162,10 +162,10 @@ Run: `npm run compile`
 
 Expected: TypeScript compilation succeeds.
 
-- [ ] **Step 2: Inspect the structural invariants**
+- [x] **Step 2: Inspect the structural invariants**
 
 Confirm by source search that `getDocument` is called only during session creation, no loop renders every page during initial layout, and every active PDF.js render task has a cancellation path.
 
-- [ ] **Step 3: Update task status**
+- [x] **Step 3: Update task status**
 
 Mark OpenSpec tasks 1.1 through 1.5 complete when their implementation and automated checks pass. Mark 1.6 complete only if the VS Code Webview smoke check was actually run.

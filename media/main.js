@@ -24,7 +24,10 @@ import {
   syncOutlineState,
 } from './historyState.js';
 import { icons } from './icons.js';
-import { renderPdf } from './pdfRenderer.js';
+import {
+  createPdfRenderSession,
+  getBufferedPageNumbers,
+} from './pdfRenderer.js';
 import { startRenderRequest } from './renderMetrics.js';
 import {
   escapeHtml,
@@ -250,6 +253,10 @@ let drawingLayer = null;
 let zoomRerenderTimer = null;
 let zoomRenderRequestId = 0;
 let resizeRerenderTimer = null;
+let pdfRenderSession = null;
+let pdfRenderSessionPromise = null;
+let pageRenderObserver = null;
+let searchPreparationId = 0;
 
 const autoSaver = createAutoSaver(() => {
   requestSave();
@@ -581,6 +588,136 @@ function requestSave() {
   });
 }
 
+async function renderPageNumbers(pageNumbers, session, metrics) {
+  const requestedPages = new Set(pageNumbers);
+  const results = await Promise.all(
+    state.pageEntries
+      .filter((pageEntry) => requestedPages.has(pageEntry.pageNumber))
+      .map(async (pageEntry) => {
+        drawingLayer?.ensurePageCanvas(pageEntry);
+        return session.renderPage(pageEntry, metrics);
+      })
+  );
+  return results.every(Boolean);
+}
+
+function observePageRendering(session) {
+  pageRenderObserver?.disconnect();
+  const observer = new IntersectionObserver(
+    (entries) => {
+      if (observer !== pageRenderObserver || session !== pdfRenderSession) {
+        return;
+      }
+      const visiblePageNumbers = entries
+        .filter((entry) => entry.isIntersecting)
+        .map((entry) => Number(entry.target.dataset.pageNumber));
+      const pageNumbers = getBufferedPageNumbers(
+        visiblePageNumbers,
+        state.totalPages
+      );
+      if (!pageNumbers.length) {
+        return;
+      }
+
+      const metrics = startRenderRequest();
+      void renderPageNumbers(pageNumbers, session, metrics)
+        .then((completed) => {
+          metrics.finish(completed ? 'completed' : 'discarded');
+        })
+        .catch((error) => {
+          metrics.finish('discarded');
+          console.error('Failed to render PDF page.', error);
+        });
+    },
+    { root: workspaceEl }
+  );
+  pageRenderObserver = observer;
+
+  for (const pageEntry of state.pageEntries) {
+    pageEntry.pageShell.dataset.pageNumber = String(pageEntry.pageNumber);
+    pageRenderObserver.observe(pageEntry.pageShell);
+  }
+}
+
+function cancelCurrentLayout() {
+  zoomRenderRequestId += 1;
+  searchPreparationId += 1;
+  if (zoomRerenderTimer) {
+    window.clearTimeout(zoomRerenderTimer);
+    zoomRerenderTimer = null;
+  }
+  if (resizeRerenderTimer) {
+    window.clearTimeout(resizeRerenderTimer);
+    resizeRerenderTimer = null;
+  }
+  pageRenderObserver?.disconnect();
+  pageRenderObserver = null;
+  pdfRenderSession?.cancelRendering();
+}
+
+async function refreshSearchResults(options = {}) {
+  const query = state.searchQuery.trim();
+  const preparationId = ++searchPreparationId;
+  const session = pdfRenderSession;
+  const pageEntries = state.pageEntries;
+  if (!query || !session) {
+    updateSearchResults(options);
+    return;
+  }
+
+  if (!options.preserveActive) {
+    state.searchMatches = [];
+    state.activeSearchMatchIndex = -1;
+    renderSearchHighlights();
+    updateSearchUI();
+  }
+
+  const metrics = startRenderRequest();
+  try {
+    const completed = await session.ensureTextLayers(pageEntries, metrics);
+    const isCurrent =
+      completed &&
+      preparationId === searchPreparationId &&
+      session === pdfRenderSession &&
+      pageEntries === state.pageEntries &&
+      query === state.searchQuery.trim();
+    metrics.finish(isCurrent ? 'completed' : 'discarded');
+    if (isCurrent) {
+      updateSearchResults(options);
+    }
+  } catch (error) {
+    metrics.finish('discarded');
+    if (preparationId === searchPreparationId) {
+      console.error('Failed to prepare PDF search.', error);
+    }
+  }
+}
+
+async function getPdfRenderSession(metrics) {
+  if (pdfRenderSession) {
+    return pdfRenderSession;
+  }
+  if (!pdfRenderSessionPromise) {
+    pdfRenderSessionPromise = createPdfRenderSession(
+      state.pdfBase64,
+      state.outlinePdfBase64 || state.pdfBase64,
+      metrics
+    );
+  }
+
+  const pendingSession = pdfRenderSessionPromise;
+  const session = await pendingSession;
+  if (pdfRenderSession === session) {
+    return session;
+  }
+  if (pendingSession !== pdfRenderSessionPromise) {
+    return null;
+  }
+  pdfRenderSession = session;
+  pdfRenderSessionPromise = null;
+  return session;
+}
+
 async function rerenderPages() {
   const requestId = ++zoomRenderRequestId;
   const metrics = startRenderRequest();
@@ -588,19 +725,17 @@ async function rerenderPages() {
     width: workspaceEl.clientWidth,
     height: workspaceEl.clientHeight,
   };
-  const { pages, outline, resolvedScale, fragment } = await renderPdf(
-    state.pdfBase64,
-    pagesEl,
-    getZoomConfig(),
-    workspaceSize,
-    state.outlinePdfBase64 || state.pdfBase64,
-    metrics
-  );
+  const session = await getPdfRenderSession(metrics);
 
-  if (requestId !== zoomRenderRequestId) {
+  if (!session || requestId !== zoomRenderRequestId) {
     metrics.finish('discarded');
     return;
   }
+
+  const { pages, outline, resolvedScale, fragment } = session.createLayout(
+    getZoomConfig(),
+    workspaceSize
+  );
 
   metrics.measure('domReplace', () => pagesEl.replaceChildren(fragment));
   state.pageEntries = pages;
@@ -641,14 +776,25 @@ async function rerenderPages() {
   renderHighlights(state.sessionAnnotations.highlights);
   renderFormFields();
   renderComments();
-  updateSearchResults({ preserveActive: true });
   renderSidebar();
   updatePageIndicator();
   updateZoomPresetIndicator();
   updateLayoutState();
   updateInteractionMode();
   restoreZoomViewport();
-  metrics.finish('completed');
+  observePageRendering(session);
+  const initialPages = getBufferedPageNumbers(
+    [state.currentPage],
+    state.totalPages
+  );
+  const completed = await renderPageNumbers(initialPages, session, metrics);
+  if (requestId !== zoomRenderRequestId || session !== pdfRenderSession) {
+    metrics.finish('discarded');
+    return;
+  }
+
+  void refreshSearchResults({ preserveActive: true });
+  metrics.finish(completed ? 'completed' : 'discarded');
 }
 
 function cancelCommentComposer() {
@@ -786,10 +932,7 @@ async function adjustZoom(delta) {
 }
 
 function scheduleZoomRerender() {
-  if (zoomRerenderTimer) {
-    window.clearTimeout(zoomRerenderTimer);
-  }
-
+  cancelCurrentLayout();
   zoomRerenderTimer = window.setTimeout(() => {
     zoomRerenderTimer = null;
     void rerenderPages();
@@ -797,20 +940,16 @@ function scheduleZoomRerender() {
 }
 
 function scheduleResponsiveRerender() {
-  if (resizeRerenderTimer) {
-    window.clearTimeout(resizeRerenderTimer);
+  if (
+    !state.pdfBase64 ||
+    !['automatic', 'page-fit', 'page-width'].includes(state.zoomMode)
+  ) {
+    return;
   }
 
+  cancelCurrentLayout();
   resizeRerenderTimer = window.setTimeout(() => {
     resizeRerenderTimer = null;
-
-    if (!state.pdfBase64) {
-      return;
-    }
-
-    if (!['automatic', 'page-fit', 'page-width'].includes(state.zoomMode)) {
-      return;
-    }
 
     state.zoomContext = createZoomContext();
     void rerenderPages();
@@ -982,7 +1121,7 @@ searchButtonEl.addEventListener('click', () => {
 searchInputEl.addEventListener('input', () => {
   state.searchQuery = searchInputEl.value;
   state.activeSearchMatchIndex = -1;
-  updateSearchResults();
+  void refreshSearchResults();
 });
 
 searchInputEl.addEventListener('keydown', (event) => {
@@ -1236,6 +1375,14 @@ window.addEventListener('message', async (event) => {
   const message = event.data;
 
   if (message.type === 'init') {
+    cancelCurrentLayout();
+    const pendingSession = pdfRenderSessionPromise;
+    pdfRenderSessionPromise = null;
+    void pendingSession
+      ?.then((session) => session.destroy())
+      .catch((error) => console.error('Failed to dispose PDF session.', error));
+    await pdfRenderSession?.destroy();
+    pdfRenderSession = null;
     state.fileName = message.payload.fileName;
     state.commentAuthor = message.payload.commentAuthor || 'PDF Studio';
     state.allowFingerDrawing = Boolean(message.payload.allowFingerDrawing);

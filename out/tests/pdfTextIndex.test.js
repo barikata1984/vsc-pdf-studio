@@ -111,4 +111,199 @@ async function loadPageTextContents(data) {
     strict_1.default.deepEqual(getBufferedPageNumbers([5], 5), [4, 5]);
     strict_1.default.deepEqual(getBufferedPageNumbers([2, 3], 5), [1, 2, 3, 4]);
 });
+(0, node_test_1.default)('render session parses one document and caches page dimensions', async () => {
+    const { createPdfRenderSession } = await importMedia('pdfRenderer.js');
+    const originalPdfjs = globalThis.pdfjsLib;
+    let documentLoads = 0;
+    let documentDestroys = 0;
+    const pageSizes = [
+        [612, 792],
+        [842, 595],
+    ];
+    const pdf = {
+        numPages: pageSizes.length,
+        async getPage(pageNumber) {
+            const [width, height] = pageSizes[pageNumber - 1];
+            return {
+                getViewport({ scale }) {
+                    return { width: width * scale, height: height * scale, scale };
+                },
+            };
+        },
+        async getOutline() {
+            return [];
+        },
+        async destroy() {
+            documentDestroys += 1;
+        },
+    };
+    globalThis.pdfjsLib = {
+        getDocument() {
+            documentLoads += 1;
+            return { promise: Promise.resolve(pdf) };
+        },
+    };
+    try {
+        const session = await createPdfRenderSession('QQ==');
+        strict_1.default.equal(documentLoads, 1);
+        strict_1.default.equal(session.pageCount, 2);
+        strict_1.default.deepEqual(session.pageSizes, [
+            { width: 612, height: 792 },
+            { width: 842, height: 595 },
+        ]);
+        await session.destroy();
+        strict_1.default.equal(documentDestroys, 1);
+    }
+    finally {
+        globalThis.pdfjsLib = originalPdfjs;
+    }
+});
+(0, node_test_1.default)('render session creates page shells and draws only requested pages', async () => {
+    const { createPdfRenderSession } = await importMedia('pdfRenderer.js');
+    const originalDocument = globalThis.document;
+    const originalPdfjs = globalThis.pdfjsLib;
+    const originalPdfjsViewer = globalThis.pdfjsViewer;
+    let renderCalls = 0;
+    let textCalls = 0;
+    let cancelCalls = 0;
+    let holdNextRender = false;
+    class FakeElement {
+        children = [];
+        className = '';
+        width = 0;
+        height = 0;
+        style = {
+            setProperty(name, value) {
+                this[name] = value;
+            },
+        };
+        classList = {
+            add: (...names) => {
+                this.className = [this.className, ...names].filter(Boolean).join(' ');
+            },
+        };
+        append(...children) {
+            this.children.push(...children);
+        }
+        getContext() {
+            return {};
+        }
+    }
+    class FakeTextLayerBuilder {
+        div = new FakeElement();
+        textDivs = [];
+        textContentItemsStr = [];
+        setTextContentSource(textContent) {
+            this.textContentItemsStr = textContent.items.map((item) => item.str);
+        }
+        async render() { }
+    }
+    const sizes = [
+        [612, 792],
+        [842, 595],
+    ];
+    const pages = sizes.map(([width, height]) => ({
+        getViewport({ scale }) {
+            return { width: width * scale, height: height * scale, scale };
+        },
+        render() {
+            renderCalls += 1;
+            let rejectRender = () => { };
+            const promise = holdNextRender
+                ? new Promise((_resolve, reject) => {
+                    rejectRender = reject;
+                })
+                : Promise.resolve();
+            return {
+                promise,
+                cancel() {
+                    cancelCalls += 1;
+                    const error = new Error('cancelled');
+                    error.name = 'RenderingCancelledException';
+                    rejectRender(error);
+                },
+            };
+        },
+        async getTextContent() {
+            textCalls += 1;
+            return { items: [{ str: `page-${width}` }] };
+        },
+    }));
+    const pdf = {
+        numPages: pages.length,
+        async getPage(pageNumber) {
+            return pages[pageNumber - 1];
+        },
+        async getOutline() {
+            return [];
+        },
+        async destroy() { },
+    };
+    globalThis.document = {
+        createDocumentFragment: () => new FakeElement(),
+        createElement: () => new FakeElement(),
+    };
+    globalThis.pdfjsLib = {
+        getDocument: () => ({ promise: Promise.resolve(pdf) }),
+    };
+    globalThis.pdfjsViewer = {
+        TextLayerBuilder: FakeTextLayerBuilder,
+    };
+    try {
+        const session = await createPdfRenderSession('QQ==');
+        const layout = session.createLayout({ mode: 'actual-size', scale: 1, layout: 'single' }, { width: 900, height: 700 });
+        strict_1.default.equal(layout.pages.length, 2);
+        strict_1.default.equal(layout.fragment.children.length, 2);
+        strict_1.default.equal(layout.pages[0].pageShell.style.width, '612px');
+        strict_1.default.equal(layout.pages[1].pageShell.style.height, '595px');
+        strict_1.default.equal(layout.pages[0].drawingCanvas.width, 1);
+        strict_1.default.equal(layout.pages[0].drawingCanvas.style.width, '612px');
+        strict_1.default.equal(renderCalls, 0);
+        strict_1.default.equal(await session.renderPage(layout.pages[1]), true);
+        strict_1.default.equal(renderCalls, 1);
+        strict_1.default.equal(layout.pages[1].renderState, 'rendered');
+        strict_1.default.deepEqual(layout.pages[1].textContentItemsStr, ['page-842']);
+        strict_1.default.equal(textCalls, 1);
+        strict_1.default.equal(await session.renderPage(layout.pages[1]), true);
+        strict_1.default.equal(renderCalls, 1);
+        strict_1.default.equal(await session.ensureTextLayers(layout.pages), true);
+        strict_1.default.equal(renderCalls, 1);
+        strict_1.default.equal(textCalls, 2);
+        holdNextRender = true;
+        const obsoleteRender = session.renderPage(layout.pages[0]);
+        session.cancelRendering();
+        strict_1.default.equal(await obsoleteRender, false);
+        strict_1.default.equal(cancelCalls, 1);
+        strict_1.default.equal(layout.pages[0].renderState, 'idle');
+        await session.destroy();
+    }
+    finally {
+        globalThis.document = originalDocument;
+        globalThis.pdfjsLib = originalPdfjs;
+        globalThis.pdfjsViewer = originalPdfjsViewer;
+    }
+});
+(0, node_test_1.default)('drawing layer expands a lazy canvas before pointer coordinates are used', async () => {
+    const { createDrawingLayer } = await importMedia('drawingLayer.js');
+    const context = { clearRect() { } };
+    const drawingCanvas = {
+        width: 1,
+        height: 1,
+        addEventListener() { },
+        getContext: () => context,
+    };
+    const pageEntry = {
+        pageNumber: 1,
+        width: 612,
+        height: 792,
+        drawingCanvas,
+        pageShell: { addEventListener() { } },
+    };
+    const layer = createDrawingLayer([pageEntry], {
+        getHighlights: () => [],
+    });
+    layer.ensurePageCanvas(pageEntry);
+    strict_1.default.equal(drawingCanvas.width, 612);
+    strict_1.default.equal(drawingCanvas.height, 792);
+});
 //# sourceMappingURL=pdfTextIndex.test.js.map

@@ -105,6 +105,20 @@ export function createDrawingLayer(pageEntries, options) {
     }
   }
 
+  function ensurePageCanvas(pageEntry) {
+    const width = Math.max(1, Math.floor(pageEntry.width));
+    const height = Math.max(1, Math.floor(pageEntry.height));
+    if (
+      pageEntry.drawingCanvas.width === width &&
+      pageEntry.drawingCanvas.height === height
+    ) {
+      return;
+    }
+    pageEntry.drawingCanvas.width = width;
+    pageEntry.drawingCanvas.height = height;
+    redrawPage(pageEntry);
+  }
+
   function toPoint(canvas, event) {
     const rect = canvas.getBoundingClientRect();
     return {
@@ -252,6 +266,7 @@ export function createDrawingLayer(pageEntries, options) {
 
         event.preventDefault();
         event.stopPropagation();
+        ensurePageCanvas(pageEntry);
         const point = {
           ...toPoint(canvas, event),
           viewportWidth: canvas.width,
@@ -268,6 +283,7 @@ export function createDrawingLayer(pageEntries, options) {
         return;
       }
 
+      ensurePageCanvas(pageEntry);
       event.preventDefault();
       canvas.setPointerCapture(event.pointerId);
       if (!isTouchInputAllowed(event, options)) {
@@ -341,6 +357,8 @@ export function createDrawingLayer(pageEntries, options) {
   }
 
   return {
+    ensurePageCanvas,
+    redrawPage,
     load(strokes) {
       state.strokes = structuredClone(strokes);
       state.currentStroke = null;

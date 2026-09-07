@@ -20,194 +20,301 @@ export function getBufferedPageNumbers(
   return [...pages].sort((left, right) => left - right);
 }
 
-export async function renderPdf(
+export async function createPdfRenderSession(
   base64,
-  container,
-  zoomConfig,
-  workspaceSize,
   outlineBase64 = base64,
   metrics = startRenderRequest()
 ) {
   const pdfjsLib = globalThis.pdfjsLib;
-  const TextLayerBuilder = globalThis.pdfjsViewer?.TextLayerBuilder;
-  if (!pdfjsLib?.getDocument || !TextLayerBuilder) {
-    throw new Error('pdf.js viewer failed to load in the webview.');
+  if (!pdfjsLib?.getDocument) {
+    throw new Error('pdf.js failed to load in the webview.');
   }
 
-  const pdfData = metrics.measure('decode', () =>
-    Uint8Array.from(atob(base64), (char) => char.charCodeAt(0))
-  );
-  const loadingTask = pdfjsLib.getDocument({
-    data: pdfData,
-    disableWorker: true,
-  });
-  const pdf = await metrics.measure('getDocument', () => loadingTask.promise);
-  let outlinePdf = pdf;
-  if (outlineBase64 && outlineBase64 !== base64) {
-    const outlinePdfData = Uint8Array.from(atob(outlineBase64), (char) =>
-      char.charCodeAt(0)
+  const loadDocument = async (source, stage) => {
+    const data = metrics.measure(
+      stage === 'getDocument' ? 'decode' : 'decode.outline',
+      () => Uint8Array.from(atob(source), (char) => char.charCodeAt(0))
     );
-    const outlineLoadingTask = pdfjsLib.getDocument({
-      data: outlinePdfData,
-      disableWorker: true,
-    });
-    outlinePdf = await metrics.measure(
-      'getDocument.outline',
-      () => outlineLoadingTask.promise
+    return metrics.measure(
+      stage,
+      () =>
+        pdfjsLib.getDocument({
+          data,
+          disableWorker: true,
+        }).promise
     );
+  };
+
+  const pdf = await loadDocument(base64, 'getDocument');
+  const outlinePdf =
+    outlineBase64 && outlineBase64 !== base64
+      ? await loadDocument(outlineBase64, 'getDocument.outline')
+      : pdf;
+  const pages = [];
+  const pageSizes = [];
+  for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
+    const page = await pdf.getPage(pageNumber);
+    const viewport = page.getViewport({ scale: 1 });
+    pages.push(page);
+    pageSizes.push({ width: viewport.width, height: viewport.height });
   }
-  const firstPage = await pdf.getPage(1);
-  const baseViewport = firstPage.getViewport({ scale: 1 });
   const outline = await metrics.measure('buildOutline', () =>
     buildOutline(outlinePdf)
   );
-  const resolvedScale = resolveScale(zoomConfig, workspaceSize, {
-    width: baseViewport.width,
-    height: baseViewport.height,
-  });
-  const renderOutputScale = resolveRenderOutputScale({
-    pageCount: pdf.numPages,
-    pageWidth: baseViewport.width,
-    pageHeight: baseViewport.height,
-    zoomScale: resolvedScale,
-    devicePixelRatio: globalThis.devicePixelRatio || 1,
-  });
-  const thumbnailWidth = pdf.numPages > 80 ? 64 : pdf.numPages > 40 ? 76 : 92;
-  const pages = [];
-  const fragment = document.createDocumentFragment();
+  let generation = 0;
+  const activeRenderTasks = new Set();
 
-  for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
-    const page = await pdf.getPage(pageNumber);
-    const viewport = page.getViewport({ scale: resolvedScale });
-    const unscaledViewport = page.getViewport({ scale: 1 });
-    const outputScale = renderOutputScale;
-    const pageShell = document.createElement('div');
-    const pdfCanvas = document.createElement('canvas');
-    const highlightLayer = document.createElement('div');
-    const searchLayer = document.createElement('div');
-    const formLayer = document.createElement('div');
-    const commentLayer = document.createElement('div');
-    const textLayerBuilder = new TextLayerBuilder({});
-    const textLayer = textLayerBuilder.div;
-    const drawingCanvas = document.createElement('canvas');
+  function cancelRendering() {
+    generation += 1;
+    for (const task of activeRenderTasks) {
+      task.cancel();
+    }
+    activeRenderTasks.clear();
+  }
 
-    pageShell.className = 'page-shell';
-    pdfCanvas.className = 'pdf-canvas';
-    highlightLayer.className = 'highlight-layer';
-    searchLayer.className = 'search-layer';
-    formLayer.className = 'form-layer';
-    commentLayer.className = 'comment-layer';
-    textLayer.classList.add('text-layer');
-    drawingCanvas.className = 'drawing-canvas';
+  function createLayout(zoomConfig, workspaceSize) {
+    const TextLayerBuilder = globalThis.pdfjsViewer?.TextLayerBuilder;
+    if (!TextLayerBuilder) {
+      throw new Error('pdf.js viewer failed to load in the webview.');
+    }
 
-    pageShell.style.setProperty('--scale-factor', String(viewport.scale));
-    pageShell.style.width = `${viewport.width}px`;
-    pageShell.style.height = `${viewport.height}px`;
-
-    pdfCanvas.width = Math.max(1, Math.floor(viewport.width * outputScale));
-    pdfCanvas.height = Math.max(1, Math.floor(viewport.height * outputScale));
-    drawingCanvas.width = viewport.width;
-    drawingCanvas.height = viewport.height;
-    pdfCanvas.style.width = `${viewport.width}px`;
-    pdfCanvas.style.height = `${viewport.height}px`;
-    drawingCanvas.style.width = `${viewport.width}px`;
-    drawingCanvas.style.height = `${viewport.height}px`;
-    textLayer.style.width = `${unscaledViewport.width}px`;
-    textLayer.style.height = `${unscaledViewport.height}px`;
-
-    pageShell.append(
-      pdfCanvas,
-      highlightLayer,
-      searchLayer,
-      textLayer,
-      formLayer,
-      commentLayer,
-      drawingCanvas
-    );
-    fragment.append(pageShell);
-
-    const pdfContext = pdfCanvas.getContext('2d');
-    await metrics.measure(
-      'page.render',
-      () =>
-        page.render({
-          canvasContext: pdfContext,
-          viewport,
-          transform:
-            outputScale === 1 ? null : [outputScale, 0, 0, outputScale, 0, 0],
-        }).promise,
-      pageNumber
-    );
-
-    const thumbnailCanvas = document.createElement('canvas');
-    const thumbnailScale = thumbnailWidth / Math.max(viewport.width, 1);
-    thumbnailCanvas.width = Math.max(
-      1,
-      Math.round(viewport.width * thumbnailScale)
-    );
-    thumbnailCanvas.height = Math.max(
-      1,
-      Math.round(viewport.height * thumbnailScale)
-    );
-    metrics.measure(
-      'page.thumbnail',
-      () =>
-        thumbnailCanvas
-          .getContext('2d')
-          .drawImage(
-            pdfCanvas,
-            0,
-            0,
-            thumbnailCanvas.width,
-            thumbnailCanvas.height
-          ),
-      pageNumber
-    );
-
-    const textContentSource = await metrics.measure(
-      'page.text',
-      () => page.getTextContent(),
-      pageNumber
-    );
-    textLayerBuilder.setTextContentSource(textContentSource);
-    await metrics.measure(
-      'page.text',
-      () => textLayerBuilder.render(viewport),
-      pageNumber
-    );
-
-    const thumbnailDataUrl = metrics.measure(
-      'page.thumbnail',
-      () => thumbnailCanvas.toDataURL('image/png'),
-      pageNumber
-    );
-
-    pages.push({
-      pageNumber,
-      pageShell,
-      pdfCanvas,
-      highlightLayer,
-      searchLayer,
-      formLayer,
-      commentLayer,
-      textLayer,
-      textDivs: textLayerBuilder.textDivs,
-      textContentItemsStr: textLayerBuilder.textContentItemsStr,
-      drawingCanvas,
-      thumbnailDataUrl,
-      width: viewport.width,
-      height: viewport.height,
-      pdfWidth: unscaledViewport.width,
-      pdfHeight: unscaledViewport.height,
+    cancelRendering();
+    const layoutGeneration = generation;
+    const basePageSize = pageSizes[0];
+    const resolvedScale = resolveScale(zoomConfig, workspaceSize, basePageSize);
+    const outputScale = resolveRenderOutputScale({
+      pageCount: pdf.numPages,
+      pageWidth: basePageSize.width,
+      pageHeight: basePageSize.height,
+      zoomScale: resolvedScale,
+      devicePixelRatio: globalThis.devicePixelRatio || 1,
     });
+    const entries = [];
+    const fragment = document.createDocumentFragment();
+
+    for (let index = 0; index < pages.length; index += 1) {
+      const page = pages[index];
+      const pageNumber = index + 1;
+      const unscaledViewport = page.getViewport({ scale: 1 });
+      const viewport = page.getViewport({ scale: resolvedScale });
+      const pageShell = document.createElement('div');
+      const pdfCanvas = document.createElement('canvas');
+      const highlightLayer = document.createElement('div');
+      const searchLayer = document.createElement('div');
+      const formLayer = document.createElement('div');
+      const commentLayer = document.createElement('div');
+      const textLayerBuilder = new TextLayerBuilder({});
+      const textLayer = textLayerBuilder.div;
+      const drawingCanvas = document.createElement('canvas');
+
+      pageShell.className = 'page-shell';
+      pdfCanvas.className = 'pdf-canvas';
+      highlightLayer.className = 'highlight-layer';
+      searchLayer.className = 'search-layer';
+      formLayer.className = 'form-layer';
+      commentLayer.className = 'comment-layer';
+      textLayer.classList.add('text-layer');
+      drawingCanvas.className = 'drawing-canvas';
+
+      pageShell.style.setProperty('--scale-factor', String(viewport.scale));
+      pageShell.style.width = `${viewport.width}px`;
+      pageShell.style.height = `${viewport.height}px`;
+      pdfCanvas.width = 1;
+      pdfCanvas.height = 1;
+      drawingCanvas.width = 1;
+      drawingCanvas.height = 1;
+      pdfCanvas.style.width = `${viewport.width}px`;
+      pdfCanvas.style.height = `${viewport.height}px`;
+      drawingCanvas.style.width = `${viewport.width}px`;
+      drawingCanvas.style.height = `${viewport.height}px`;
+      textLayer.style.width = `${unscaledViewport.width}px`;
+      textLayer.style.height = `${unscaledViewport.height}px`;
+
+      pageShell.append(
+        pdfCanvas,
+        highlightLayer,
+        searchLayer,
+        textLayer,
+        formLayer,
+        commentLayer,
+        drawingCanvas
+      );
+      fragment.append(pageShell);
+      entries.push({
+        pageNumber,
+        page,
+        pageShell,
+        pdfCanvas,
+        highlightLayer,
+        searchLayer,
+        formLayer,
+        commentLayer,
+        textLayer,
+        textLayerBuilder,
+        textDivs: [],
+        textContentItemsStr: [],
+        drawingCanvas,
+        thumbnailDataUrl: '',
+        width: viewport.width,
+        height: viewport.height,
+        pdfWidth: unscaledViewport.width,
+        pdfHeight: unscaledViewport.height,
+        viewport,
+        outputScale,
+        generation: layoutGeneration,
+        renderState: 'idle',
+        renderPromise: null,
+        renderTask: null,
+      });
+    }
+
+    return {
+      pages: entries,
+      outline,
+      resolvedScale,
+      fragment,
+    };
+  }
+
+  async function ensureTextLayer(pageEntry, pageMetrics = metrics) {
+    if (pageEntry.generation !== generation) {
+      return false;
+    }
+    if (pageEntry.textReady) {
+      return true;
+    }
+    if (!pageEntry.textPromise) {
+      const entryGeneration = pageEntry.generation;
+      pageEntry.textPromise = (async () => {
+        const textContentSource = await pageMetrics.measure(
+          'page.text',
+          () => pageEntry.page.getTextContent(),
+          pageEntry.pageNumber
+        );
+        if (entryGeneration !== generation) {
+          return false;
+        }
+        pageEntry.textLayerBuilder.setTextContentSource(textContentSource);
+        await pageMetrics.measure(
+          'page.text',
+          () => pageEntry.textLayerBuilder.render(pageEntry.viewport),
+          pageEntry.pageNumber
+        );
+        if (entryGeneration !== generation) {
+          return false;
+        }
+        pageEntry.textDivs = pageEntry.textLayerBuilder.textDivs;
+        pageEntry.textContentItemsStr =
+          pageEntry.textLayerBuilder.textContentItemsStr;
+        pageEntry.textReady = true;
+        return true;
+      })();
+    }
+    return pageEntry.textPromise;
+  }
+
+  async function renderPage(pageEntry, pageMetrics = metrics) {
+    if (pageEntry.generation !== generation) {
+      return false;
+    }
+    if (pageEntry.renderState === 'rendered') {
+      return true;
+    }
+    if (pageEntry.renderPromise) {
+      return pageEntry.renderPromise;
+    }
+
+    const entryGeneration = pageEntry.generation;
+    pageEntry.renderState = 'rendering';
+    const renderPromise = (async () => {
+      pageEntry.pdfCanvas.width = Math.max(
+        1,
+        Math.floor(pageEntry.width * pageEntry.outputScale)
+      );
+      pageEntry.pdfCanvas.height = Math.max(
+        1,
+        Math.floor(pageEntry.height * pageEntry.outputScale)
+      );
+      const renderTask = pageEntry.page.render({
+        canvasContext: pageEntry.pdfCanvas.getContext('2d'),
+        viewport: pageEntry.viewport,
+        transform:
+          pageEntry.outputScale === 1
+            ? null
+            : [pageEntry.outputScale, 0, 0, pageEntry.outputScale, 0, 0],
+      });
+      pageEntry.renderTask = renderTask;
+      activeRenderTasks.add(renderTask);
+      try {
+        await pageMetrics.measure(
+          'page.render',
+          () => renderTask.promise,
+          pageEntry.pageNumber
+        );
+      } catch (error) {
+        if (
+          entryGeneration !== generation ||
+          error?.name === 'RenderingCancelledException'
+        ) {
+          return false;
+        }
+        throw error;
+      } finally {
+        activeRenderTasks.delete(renderTask);
+        if (pageEntry.renderTask === renderTask) {
+          pageEntry.renderTask = null;
+        }
+      }
+
+      if (
+        entryGeneration !== generation ||
+        !(await ensureTextLayer(pageEntry, pageMetrics))
+      ) {
+        return false;
+      }
+      pageEntry.renderState = 'rendered';
+      pageEntry.pageShell.classList.add('is-rendered');
+      return true;
+    })();
+    pageEntry.renderPromise = renderPromise;
+    try {
+      return await renderPromise;
+    } finally {
+      if (
+        pageEntry.renderPromise === renderPromise &&
+        pageEntry.renderState !== 'rendered'
+      ) {
+        pageEntry.renderState = 'idle';
+        pageEntry.renderPromise = null;
+      }
+    }
+  }
+
+  async function ensureTextLayers(pageEntries, pageMetrics = metrics) {
+    for (const pageEntry of pageEntries) {
+      if (!(await ensureTextLayer(pageEntry, pageMetrics))) {
+        return false;
+      }
+    }
+    return true;
   }
 
   return {
+    pageCount: pdf.numPages,
+    pageSizes,
     pages,
     outline,
-    resolvedScale,
-    fragment,
-    metrics,
+    createLayout,
+    renderPage,
+    ensureTextLayers,
+    cancelRendering,
+    async destroy() {
+      cancelRendering();
+      await pdf.destroy();
+      if (outlinePdf !== pdf) {
+        await outlinePdf.destroy();
+      }
+    },
   };
 }
 

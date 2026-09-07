@@ -173,8 +173,11 @@ export function createSidebarController({
       button.type = 'button';
       button.className = 'sidebar-item page-nav-item';
       button.dataset.page = String(pageEntry.pageNumber);
+      const thumbnail = pageEntry.thumbnailDataUrl
+        ? `<img class="page-nav-thumb" src="${pageEntry.thumbnailDataUrl}" alt="Page ${pageEntry.pageNumber} preview" />`
+        : `<span class="page-nav-thumb" style="aspect-ratio:${pageEntry.width}/${pageEntry.height}" aria-hidden="true"></span>`;
       button.innerHTML = `
-        <img class="page-nav-thumb" src="${pageEntry.thumbnailDataUrl}" alt="Page ${pageEntry.pageNumber} preview" />
+        ${thumbnail}
         <span class="page-nav-copy">
           <span class="sidebar-item-title">Page ${pageEntry.pageNumber}</span>
         </span>
