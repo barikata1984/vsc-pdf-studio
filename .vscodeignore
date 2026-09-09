@@ -28,3 +28,4 @@ models/**
 storage/**
 tsconfig.json
 package-lock.json
+main.pdf
